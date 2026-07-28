@@ -1,0 +1,29 @@
+# Example configuration for archive-relay. Copy to config.yaml and edit.
+relay:
+  addr: ":3334"           # websocket/http listen address
+  serviceURL: ""          # canonical URL, used for NIP-42 AUTH (leave empty to disable)
+
+clickhouse:
+  addr: "localhost:9000"  # native protocol host:port
+  database: "archive_relay"
+  username: "default"
+  password: ""
+
+sqlite:
+  path: "./control.db"    # embedded control plane (crawler/scheduler/auth state)
+
+batch:
+  maxSize: 10000          # flush a tier after this many buffered events
+  maxAge: 1s              # ...or after this duration, whichever is first
+
+retention:                # per-tier TTL DELETE interval; empty = keep forever
+  permanent: ""           # kinds 0,3,9735,10002
+  archive: "10 YEAR"      # kind 1
+  social: "1 YEAR"        # kinds 6,7,16
+  transient: "30 DAY"     # (reserved — no kinds map here yet)
+
+# Optional: override the built-in kind→tier classifier without recompiling.
+# Keys are kind numbers; values are permanent|archive|social|transient|drop.
+# classifier:
+#   5: permanent          # store NIP-09 deletion events as data
+#   30023: archive        # long-form articles

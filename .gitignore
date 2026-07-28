@@ -1,0 +1,24 @@
+# binaries
+/bin/
+/archive-relay
+*.exe
+*.test
+
+# local runtime state (NEVER commit)
+control.db
+control.db-*
+*.log
+run-*.yaml
+
+# clickhouse local data if anyone runs it in-repo
+/ch-data/
+
+# editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# env / secrets
+.env
+.env.*
