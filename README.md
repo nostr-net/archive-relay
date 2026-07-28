@@ -1,9 +1,5 @@
 # archive-relay
 
-[![CI](https://github.com/nostr-net/archive-relay/actions/workflows/ci.yml/badge.svg)](https://github.com/nostr-net/archive-relay/actions/workflows/ci.yml)
-[![Go Reference](https://pkg.go.dev/badge/github.com/nostr-net/archive-relay.svg)](https://pkg.go.dev/github.com/nostr-net/archive-relay)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-
 A **selective social-core Nostr archive relay** — one Go binary on
 [`khatru`](https://github.com/fiatjaf/khatru) + [ClickHouse](https://clickhouse.com/)
 (+ embedded SQLite for the control plane). Stores only kinds
@@ -55,17 +51,6 @@ khatru + REST + crawler + scheduler ──▶ ClickHouse (events, tombstones, st
                                       ──▶ SQLite     (dedup, scheduled events)
 ```
 
-One binary, no Postgres, no Redis. Design rationale in
-[`ANALYSIS.md`](./ANALYSIS.md); roadmap in [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md).
-
-## Limitations
-
-- Compression validated only to ~tens of thousands of rows (needs a
-  million-row negentropy backfill to confirm the expected 6–15× vs postgres).
-- Single-node ClickHouse (no replication configured).
-- NIP-42 AUTH not enforced — open reads/writes; rely on the rate limiter +
-  reverse proxy + a private ClickHouse until wired.
-- Negentropy is served, not pulled (deep backfill is planned).
 
 ## License
 
