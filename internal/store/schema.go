@@ -82,8 +82,8 @@ LAYOUT(HASHED())
 LIFETIME(MIN 0 MAX 60);
 `
 
-// snapshotsDDL creates the stats tables (ANALYSIS.md §3e). Refresh jobs populate
-// them; they survive raw-data TTL.
+// snapshotsDDL creates the stats tables. Refresh jobs populate them; they survive
+// raw-data TTL.
 const snapshotsDDL = `
 CREATE TABLE IF NOT EXISTS stats_note_monthly (
   note_id String,

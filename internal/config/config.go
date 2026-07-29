@@ -18,6 +18,10 @@ type Config struct {
 	// Classifier optionally overrides the built-in kind→tier map.
 	// Keys are kind numbers, values are tier names: permanent|archive|social|transient|drop.
 	Classifier map[int]string `yaml:"classifier"`
+
+	// Policy caps the breadth of inbound REQ/COUNT filters so a hostile client
+	// can't force huge scans. A zero field means "no limit" for that field.
+	Policy Policy `yaml:"policy"`
 }
 
 type Relay struct {
@@ -49,6 +53,15 @@ type Retention struct {
 	Transient string `yaml:"transient"` // e.g. "30 DAY"
 }
 
+// Policy sets inbound filter-breadth limits enforced at the relay hooks. A zero
+// field disables that specific limit. Loaded from the `policy` YAML block.
+type Policy struct {
+	MaxIDs     int `yaml:"maxIDs"`     // max IDs per filter
+	MaxAuthors int `yaml:"maxAuthors"` // max authors per filter
+	MaxKinds   int `yaml:"maxKinds"`   // max kinds per filter
+	MaxTags    int `yaml:"maxTags"`    // max total tag values per filter
+}
+
 // Load reads and parses the config file, applying defaults.
 func Load(path string) (*Config, error) {
 	c := defaults()
@@ -74,5 +87,6 @@ func defaults() *Config {
 		// large parts. Dev/tests override these explicitly.
 		Batch:     Batch{MaxSize: 5000, MaxAge: 5 * time.Second},
 		Retention: Retention{Archive: "10 YEAR", Social: "1 YEAR", Transient: "30 DAY"},
+		Policy:    Policy{MaxIDs: 1000, MaxAuthors: 1000, MaxKinds: 20, MaxTags: 256},
 	}
 }

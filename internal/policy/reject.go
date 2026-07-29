@@ -12,7 +12,6 @@ import (
 // RejectOutOfScope is the primary ingress gate: drops events whose kind is not
 // in the archive scope (the nostrarchives social core: 0,1,3,6,7,16,9735,10002).
 // The scope check delegates to store.TierForKind so there's one source of truth.
-// ANALYSIS.md §3d① (D8/D9).
 func RejectOutOfScope(_ context.Context, evt *nostr.Event) (bool, string) {
 	if store.TierForKind(evt.Kind) == store.TierDrop {
 		return true, "kind out of scope"

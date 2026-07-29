@@ -8,6 +8,7 @@ import (
 	"flag"
 	"log/slog"
 	"net/http"
+	_ "net/http/pprof" // registers /debug/pprof handlers on http.DefaultServeMux
 	"os"
 	"os/signal"
 	"syscall"
@@ -73,17 +74,35 @@ func main() {
 	// The closure is only invoked from sched.Run (goroutine), by which point rl is set.
 	var rl *khatru.Relay
 	wot := &policy.WoT{Lookup: svc.Followers, Threshold: 0} // Threshold 0 = WoT disabled; set >0 to gate reads
-	limiter := policy.NewLimiter(600)                       // per-IP events/REST per minute; tune for your threat model
+	limiter := policy.NewLimiter(600)                       // per-IP events/reads/REST per minute; tune for your threat model
+	breadth := policy.RejectFilterBreadth{
+		MaxIDs: cfg.Policy.MaxIDs, MaxAuthors: cfg.Policy.MaxAuthors,
+		MaxKinds: cfg.Policy.MaxKinds, MaxTags: cfg.Policy.MaxTags,
+	}
 	sched := scheduler.New(cdb.Conn(),
 		func(ctx context.Context, evt *nostr.Event) error {
 			_, err := rl.AddEvent(ctx, evt)
 			return err
 		},
 		60*time.Second, log.With("pkg", "scheduler"))
-	rl = relay.New(relay.Deps{Store: s, Sched: sched, WoT: wot, Limiter: limiter})
+	rl = relay.New(relay.Deps{Store: s, Sched: sched, WoT: wot, Limiter: limiter, Breadth: breadth})
 	go sched.Run(ctx)
 
 	api.NewHandler(svc, s, limiter, log.With("pkg", "api")).Register(rl.Router())
+
+	// Ops profiling (stdlib pprof) on loopback only — never on the public port.
+	// net/http/pprof registers its handlers on http.DefaultServeMux at import.
+	pprofSrv := &http.Server{Addr: "127.0.0.1:6060", Handler: http.DefaultServeMux}
+	go func() {
+		<-ctx.Done()
+		_ = pprofSrv.Shutdown(context.Background())
+	}()
+	go func() {
+		log.Info("pprof listening", "addr", pprofSrv.Addr)
+		if err := pprofSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Warn("pprof server stopped", "err", err)
+		}
+	}()
 
 	srv := &http.Server{Addr: cfg.Relay.Addr, Handler: rl}
 	go func() {

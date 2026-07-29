@@ -72,6 +72,16 @@ func (l *Limiter) RejectEvent(ctx context.Context, _ *nostr.Event) (bool, string
 	return false, ""
 }
 
+// RejectFilter implements the khatru RejectFilter / RejectCountFilter hook
+// signature, extending per-IP rate limiting to the read path so a hostile
+// client cannot drive many expensive FINAL scans across the tiers.
+func (l *Limiter) RejectFilter(ctx context.Context, _ nostr.Filter) (bool, string) {
+	if !l.Allow(khatru.GetIP(ctx)) {
+		return true, "rate-limited: too many reads from this IP"
+	}
+	return false, ""
+}
+
 // HTTP returns middleware that enforces the same per-IP limit on REST routes.
 func (l *Limiter) HTTP(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

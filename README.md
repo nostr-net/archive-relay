@@ -4,17 +4,19 @@ A **selective social-core Nostr archive relay** — one Go binary on
 [`khatru`](https://github.com/fiatjaf/khatru) + [ClickHouse](https://clickhouse.com/)
 (+ embedded SQLite for the control plane). Stores only kinds
 `0, 1, 3, 6, 7, 16, 9735, 10002` (profiles, notes, contacts, reposts, reactions,
-zaps, relay lists). DMs, gift wraps, and ephemeral kinds are out of scope by
-design ([`ANALYSIS.md`](./ANALYSIS.md) §3d).
+zaps, relay lists). DMs, gift wraps, and ephemeral kinds are out of scope by design.
 
 ## Quickstart
 
 ```bash
-docker compose -f deploy/docker-compose.yml up -d   # ClickHouse
+docker compose -f deploy/docker-compose.yml up -d   # ClickHouse (dev)
 make build
 cp config.example.yaml config.yaml
 ./archive-relay --config config.yaml                # :3334, crawls 4 relays
 ```
+
+Plain HTTP/WS by design — front it with a TLS proxy (Caddy/nginx/Traefik) for
+`wss://`, and give ClickHouse a password before exposing it.
 
 ```bash
 # nostr relay
@@ -32,15 +34,18 @@ curl localhost:3334/v1/pubkey/<pubkey>      # followers
 
 YAML, production-tuned defaults — see [`config.example.yaml`](./config.example.yaml).
 Key knobs: `batch.maxSize`/`maxAge` (insert coalescing), per-tier `retention.*`
-TTL, and an optional `classifier` map to override kind→tier without recompiling.
-Crawler sources are the `-sources` flag.
+TTL, `policy.*` REQ-breadth limits, and an optional `classifier` map to override
+kind→tier without recompiling. Crawler sources are the `-sources` flag.
 
 ## Test
 
 ```bash
-make test-unit          # no deps
+make test-unit          # no external deps
 make test-integration   # needs ClickHouse on localhost:9000
 ```
+
+Ops profiling (stdlib `pprof`) binds to `127.0.0.1:6060` and is never exposed
+on the public relay port.
 
 CI runs both, integration against a ClickHouse service container.
 

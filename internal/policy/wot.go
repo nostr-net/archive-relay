@@ -15,7 +15,7 @@ type LookupFollowers func(ctx context.Context, pubkey string) (int64, error)
 // WoT is a read-time web-of-trust filter: it drops events whose author has
 // fewer than Threshold followers, using a short-TTL cache to avoid hammering
 // the follower-counts table. A Threshold of 0 disables filtering entirely.
-// ANALYSIS.md §3e (read-time filter, not an ingest gate).
+// This is a read-time filter, not an ingest gate.
 type WoT struct {
 	Lookup    LookupFollowers
 	Threshold int64

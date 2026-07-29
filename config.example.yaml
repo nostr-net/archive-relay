@@ -16,6 +16,12 @@ batch:
   maxSize: 10000          # flush a tier after this many buffered events
   maxAge: 1s              # ...or after this duration, whichever is first
 
+policy:                  # REQ/COUNT breadth caps; 0 on a field = no limit
+  maxIDs: 1000
+  maxAuthors: 1000
+  maxKinds: 20
+  maxTags: 256
+
 retention:                # per-tier TTL DELETE interval; empty = keep forever
   permanent: ""           # kinds 0,3,9735,10002
   archive: "10 YEAR"      # kind 1

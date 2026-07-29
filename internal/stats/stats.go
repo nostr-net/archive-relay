@@ -1,6 +1,6 @@
-// Package stats maintains the snapshot/aggregate tables (ANALYSIS.md §3e) and
-// exposes query helpers for the stats API. Refresh jobs recompute from FINAL
-// reads with count(DISTINCT id), so duplicate ingests never inflate them.
+// Package stats maintains the snapshot/aggregate tables and exposes query
+// helpers for the stats API. Refresh jobs recompute from FINAL reads with
+// count(DISTINCT id), so duplicate ingests never inflate them.
 package stats
 
 import (
@@ -85,7 +85,7 @@ GROUP BY p_tag`
 }
 
 // RefreshNoteMonthly recomputes per-note-per-month engagement for the current
-// and previous month (stragglers); older months are frozen. §3e.
+// and previous month (stragglers); older months are frozen.
 func (s *Service) RefreshNoteMonthly(ctx context.Context) error {
 	if err := s.ch.Exec(ctx,
 		"DELETE FROM stats_note_monthly WHERE month >= toStartOfMonth(addMonths(today(), -1))"); err != nil {

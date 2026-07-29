@@ -1,6 +1,6 @@
 # Build the archive-relay binary.
 # Multi-stage: small final image, no toolchain in the runtime layer.
-FROM golang:1.24 AS build
+FROM golang:1.25 AS build
 WORKDIR /src
 # cache deps
 COPY go.mod go.sum ./

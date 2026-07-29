@@ -1,7 +1,7 @@
 // Package store is the ClickHouse-backed eventstore.Store implementation for
-// the archive relay. It owns: tier tables (§3d), the tombstone dictionary (§3c),
-// per-tier batched inserts (§3a), and replaceable dedup via ReplacingMergeTree
-// + FINAL on read (§3b).
+// the archive relay. It owns the tier tables, the tombstone dictionary,
+// per-tier batched inserts, and replaceable dedup via ReplacingMergeTree
+// with FINAL on read.
 package store
 
 import (
@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
@@ -86,7 +87,7 @@ func (s *Store) CH() driver.Conn { return s.ch }
 
 // SetOnFlushed registers a callback fired after a batch is durably written to
 // ClickHouse on ANY tier. Used by the crawler to record durable dedup state
-// only after the data is safe (crash-hole fix, ANALYSIS.md production note).
+// only after the data is safe — never mark an event "seen" before it is stored.
 func (s *Store) SetOnFlushed(fn func(events []*nostr.Event)) {
 	for _, b := range s.tiers {
 		b.OnFlushed = fn
@@ -120,16 +121,31 @@ func (s *Store) SaveEvent(ctx context.Context, evt *nostr.Event) error {
 
 // DeleteEvent records a tombstone (instant hide via the dictionary) and reloads
 // the dictionary so the hide is visible to subsequent reads immediately.
-// Physical reclamation, if ever wanted, is a separate periodic ALTER DELETE job. §3c.
+// Physical reclamation, if ever wanted, is a separate periodic ALTER DELETE job.
 func (s *Store) DeleteEvent(ctx context.Context, evt *nostr.Event) error {
+	return s.retireIDs(ctx, []string{evt.ID}, "nip09", evt.PubKey)
+}
+
+// retireIDs tombstones a batch of event ids with a single dictionary reload, so
+// the hides are visible to subsequent reads immediately. Used by DeleteEvent
+// (NIP-09) and ReplaceEvent (superseded versions). reason is a short
+// LowCardinality label ("nip09" / "replaced"); deletedBy is the acting pubkey
+// ("" when unknown, e.g. internal retirement). An insert error aborts the batch;
+// the caller decides whether to surface or log it.
+func (s *Store) retireIDs(ctx context.Context, ids []string, reason, deletedBy string) error {
+	if len(ids) == 0 {
+		return nil
+	}
 	ctx2, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	if err := s.ch.Exec(ctx2,
-		"INSERT INTO tombstones (id, reason, deleted_by) VALUES (?, ?, ?)",
-		evt.ID, "nip09", evt.PubKey); err != nil {
-		return err
+	for _, id := range ids {
+		if err := s.ch.Exec(ctx2,
+			"INSERT INTO tombstones (id, reason, deleted_by) VALUES (?, ?, ?)",
+			id, reason, deletedBy); err != nil {
+			return err
+		}
 	}
-	// make the hide visible now (auto-refresh would also do this within LIFETIME)
+	// make the hides visible now (auto-refresh would also do this within LIFETIME)
 	_ = s.ch.Exec(ctx2, "SYSTEM RELOAD DICTIONARY tombstone_dict")
 	return nil
 }
@@ -139,7 +155,7 @@ func (s *Store) DeleteEvent(ctx context.Context, evt *nostr.Event) error {
 // be served. Because the tier ORDER BY includes created_at (for query
 // performance), ReplacingMergeTree alone does NOT collapse different versions,
 // so we retire older versions via the tombstone path and save the new one.
-// ANALYSIS.md §3b. Non-replaceable kinds fall through to a plain save.
+// Non-replaceable kinds fall through to a plain save.
 func (s *Store) ReplaceEvent(ctx context.Context, evt *nostr.Event) error {
 	if !isReplaceableKind(evt.Kind) {
 		return s.SaveEvent(ctx, evt)
@@ -152,15 +168,22 @@ func (s *Store) ReplaceEvent(ctx context.Context, evt *nostr.Event) error {
 		return fmt.Errorf("replace query: %w", err)
 	}
 	shouldStore := true
+	var retire []string
 	for prev := range ch {
 		// prev is "older" (should be retired) if it has an earlier timestamp,
 		// or the same timestamp but a higher id (NIP-01 keeps the lowest id).
 		prevOlder := prev.CreatedAt < evt.CreatedAt ||
 			(prev.CreatedAt == evt.CreatedAt && prev.ID > evt.ID)
 		if prevOlder {
-			_ = s.DeleteEvent(ctx, prev)
+			retire = append(retire, prev.ID)
 		} else {
 			shouldStore = false // an equal-or-newer version exists; discard incoming
+		}
+	}
+	// retire all superseded versions in one batch with a single dictionary reload
+	if len(retire) > 0 {
+		if err := s.retireIDs(ctx, retire, "replaced", evt.PubKey); err != nil {
+			s.log.Warn("retire superseded versions failed", "n", len(retire), "err", err)
 		}
 	}
 	if shouldStore {
@@ -268,12 +291,11 @@ func tiersForFilter(f nostr.Filter, override map[int]string) []string {
 }
 
 func sortDesc(ev []*nostr.Event) {
-	// simple insertion-friendly sort; sizes are bounded by limit*numTiers
-	for i := 1; i < len(ev); i++ {
-		for j := i; j > 0 && ev[j-1].CreatedAt < ev[j].CreatedAt; j-- {
-			ev[j-1], ev[j] = ev[j], ev[j-1]
-		}
-	}
+	// stable: equal-timestamp events keep their tier-query order, which already
+	// sorted by id, so the cross-tier merge is deterministic.
+	sort.SliceStable(ev, func(i, j int) bool {
+		return ev[i].CreatedAt > ev[j].CreatedAt
+	})
 }
 
 // scanEvent reads a tier-table row (in tierColumns order) into a nostr.Event.

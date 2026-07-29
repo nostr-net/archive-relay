@@ -22,8 +22,8 @@ func TierForKind(kind int) string { return classify(kind) }
 // build its subscription filter. Mirrors the classify() switch.
 func InScopeKinds() []int { return []int{0, 1, 3, 6, 7, 16, 9735, 10002} }
 
-// classify maps a nostr kind to a retention tier, aligned to nostrarchives-api's
-// implemented social-core scope (ANALYSIS.md §3d①). Unknown kinds → drop.
+// classify maps a nostr kind to a retention tier, aligned to the social-core
+// scope. Unknown kinds → drop.
 //
 // This is the single source of truth for "what does this relay store". Override
 // per-instance via config.Classifier if you want to tune without recompiling.

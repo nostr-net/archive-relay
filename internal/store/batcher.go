@@ -14,10 +14,10 @@ import (
 
 // ErrBatchFull is returned by SaveEvent when a tier's buffer is full, so khatru
 // rejects the event with OK:false and the client retries / backs off. This is
-// the load-shedding backpressure valve (ANALYSIS.md §3a).
+// the load-shedding backpressure valve.
 var ErrBatchFull = errors.New("batch buffer full; event rejected (retry)")
 
-// batcher decouples SaveEvent from the actual ClickHouse INSERT (§3a). It keeps
+// batcher decouples SaveEvent from the actual ClickHouse INSERT. It keeps
 // a bounded in-memory channel per tier; a single worker goroutine owns the
 // buffer and is the ONLY goroutine that touches it. FlushAll requests a flush
 // through flushReq and waits for the worker to service it, so there is no race

@@ -9,7 +9,8 @@ control.db
 control.db-*
 *.log
 run-*.yaml
-
+ANALYSIS.md
+IMPLEMENTATION_PLAN.md
 # clickhouse local data if anyone runs it in-repo
 /ch-data/
 
