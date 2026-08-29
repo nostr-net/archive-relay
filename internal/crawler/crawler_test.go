@@ -44,12 +44,14 @@ func resetDB(t *testing.T) {
 	_ = admin.Close()
 }
 
-// TestCrawlerIngestsFromRelayNostrNet connects to the real relay.nostr.net,
-// ingests for 20s, and verifies that in-scope events land in ClickHouse.
-func TestCrawlerIngestsFromRelayNostrNet(t *testing.T) {
+// TestCrawlerIngestsFromLiveRelay connects to a real relay, ingests for 20s,
+// and verifies that in-scope events land in ClickHouse. The source relay is
+// env-overridable (CRAWLER_SOURCE) so a dead upstream doesn't break the run.
+func TestCrawlerIngestsFromLiveRelay(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping live network test in -short mode")
 	}
+	src := envOr("CRAWLER_SOURCE", "wss://relay.damus.io")
 	resetDB(t)
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
@@ -70,7 +72,7 @@ func TestCrawlerIngestsFromRelayNostrNet(t *testing.T) {
 	}
 	defer s.Close()
 
-	cr := New([]string{"wss://relay.nostr.net"}, s, cdb, log.With("pkg", "crawler"))
+	cr := New([]string{src}, s, NewDedup(cdb), log.With("pkg", "crawler"))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -91,7 +93,7 @@ func TestCrawlerIngestsFromRelayNostrNet(t *testing.T) {
 	}
 	fmt.Println("total ingested:", total)
 	if total == 0 {
-		t.Fatal("expected >0 events ingested from relay.nostr.net, got 0")
+		t.Fatalf("expected >0 events ingested from %s, got 0", src)
 	}
 
 	// every stored row must be an in-scope kind (1,3,6,7,16,9735,10002,0)

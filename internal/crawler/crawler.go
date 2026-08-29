@@ -6,7 +6,6 @@ package crawler
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"math"
 	"sync"
@@ -14,7 +13,6 @@ import (
 
 	"github.com/nbd-wtf/go-nostr"
 
-	"github.com/nostr-net/archive-relay/internal/control"
 	"github.com/nostr-net/archive-relay/internal/store"
 )
 
@@ -22,25 +20,15 @@ import (
 type Crawler struct {
 	sources []string
 	store   *store.Store
-	ctrl    *control.DB
+	dedup   *Dedup
 	log     *slog.Logger
-	seen    sync.Map // in-memory dedup cache (id -> struct{}); fast hot-path skip
 }
 
-// New constructs a Crawler for the given source relay URLs. It wires the
-// store's post-flush hook so durable dedup state (seen_events) is recorded
-// ONLY after events are safely in ClickHouse — preventing the crash-hole where
-// an event is marked "seen" but never actually stored.
-func New(sources []string, s *store.Store, ctrl *control.DB, log *slog.Logger) *Crawler {
-	c := &Crawler{sources: sources, store: s, ctrl: ctrl, log: log}
-	s.SetOnFlushed(func(events []*nostr.Event) {
-		ctx := context.Background()
-		for _, ev := range events {
-			c.seen.Store(ev.ID, struct{}{})
-			_, _ = ctrl.MarkSeen(ctx, ev.ID, int64(ev.CreatedAt))
-		}
-	})
-	return c
+// New constructs a firehose Crawler for the given source relay URLs. dedup is
+// shared with any per-pubkey PriorityCrawler; wire dedup.OnFlushed to
+// store.SetOnFlushed once at startup.
+func New(sources []string, s *store.Store, dedup *Dedup, log *slog.Logger) *Crawler {
+	return &Crawler{sources: sources, store: s, dedup: dedup, log: log}
 }
 
 // Run starts ingestion from all sources and blocks until ctx is canceled.
@@ -73,7 +61,7 @@ func (c *Crawler) pruneLoop(ctx context.Context, every, maxAge time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if n, err := c.ctrl.PruneSeen(ctx, maxAge); err != nil {
+			if n, err := c.dedup.ctrl.PruneSeen(ctx, maxAge); err != nil {
 				c.log.Warn("prune seen_events failed", "err", err)
 			} else if n > 0 {
 				c.log.Info("pruned seen_events", "rows", n)
@@ -137,35 +125,9 @@ func (c *Crawler) runSource(ctx context.Context, url string, kinds []int) {
 }
 
 // handle applies in-memory dedup (fast hot path) and saves new events to
-// ClickHouse. Durable dedup (seen_events) is recorded post-flush by the
-// OnFlushed hook wired in New — so a crash between enqueue and flush leaves
-// the event un-marked, and a later negentropy re-sync recovers it (RMT dedups
-// the duplicate). Returns true if the event was newly enqueued.
+// ClickHouse through the shared ingest path.
 func (c *Crawler) handle(ctx context.Context, ev *nostr.Event) bool {
-	if _, ok := c.seen.Load(ev.ID); ok {
-		return false // hot-path dedup (in-memory)
-	}
-	if store.TierForKind(ev.Kind) == store.TierDrop {
-		return false // out of scope
-	}
-	if ok, _ := ev.CheckSignature(); !ok {
-		return false // invalid signature
-	}
-	// Optimistic: mark in-memory seen now to dedupe within the current buffer
-	// window; the durable record happens post-flush. If SaveEvent fails below,
-	// we leave it marked (harmless: worst case it's skipped until restart, and
-	// RMT/seen reconciliation recovers).
-	c.seen.Store(ev.ID, struct{}{})
-	if err := c.store.SaveEvent(ctx, ev); err != nil {
-		if errors.Is(err, store.ErrBatchFull) {
-			c.seen.Delete(ev.ID) // back off; let a later re-pull try again
-			c.log.Warn("batch full; event dropped (will re-ingest next sync)", "id", ev.ID)
-		} else {
-			c.log.Warn("save failed", "id", ev.ID, "err", err)
-		}
-		return false
-	}
-	return true
+	return ingest(ctx, c.store, c.dedup, c.log, ev)
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) {

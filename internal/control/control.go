@@ -41,6 +41,14 @@ CREATE TABLE IF NOT EXISTS seen_events (
   id TEXT PRIMARY KEY,
   created_at INTEGER NOT NULL DEFAULT 0
 );
+
+-- Customers granted relay access. Mutated via NIP-86 management RPC (and later
+-- the freedompay webhook). Static always-allowed keys live in config instead.
+CREATE TABLE IF NOT EXISTS allowed_pubkeys (
+  pubkey     TEXT PRIMARY KEY,
+  note       TEXT,
+  created_at INTEGER NOT NULL DEFAULT 0
+);
 `
 
 // DB wraps the SQLite connection used by crawler, scheduler, and auth.
@@ -94,4 +102,74 @@ func (d *DB) PruneSeen(ctx context.Context, maxAge time.Duration) (int64, error)
 	}
 	n, _ := res.RowsAffected()
 	return n, nil
+}
+
+// AllowedPubkey is one row of the dynamic allow-list.
+type AllowedPubkey struct {
+	Pubkey    string
+	Note      string
+	CreatedAt int64
+}
+
+// AllowPubkey grants access to a pubkey (INSERT OR REPLACE so it's idempotent).
+func (d *DB) AllowPubkey(ctx context.Context, pubkey, note string) error {
+	_, err := d.conn.ExecContext(ctx,
+		"INSERT OR REPLACE INTO allowed_pubkeys(pubkey, note, created_at) VALUES(?, ?, ?)",
+		pubkey, note, time.Now().Unix())
+	return err
+}
+
+// RevokePubkey removes a pubkey's access. No-op (no error) if not present.
+func (d *DB) RevokePubkey(ctx context.Context, pubkey string) error {
+	_, err := d.conn.ExecContext(ctx, "DELETE FROM allowed_pubkeys WHERE pubkey = ?", pubkey)
+	return err
+}
+
+// ListAllowed returns every dynamic allow-list row, oldest first.
+func (d *DB) ListAllowed(ctx context.Context) ([]AllowedPubkey, error) {
+	rows, err := d.conn.QueryContext(ctx,
+		"SELECT pubkey, note, created_at FROM allowed_pubkeys ORDER BY created_at")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AllowedPubkey
+	for rows.Next() {
+		var a AllowedPubkey
+		if err := rows.Scan(&a.Pubkey, &a.Note, &a.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// LoadAllowedSet returns the set of allowed pubkeys for an in-memory cache.
+func (d *DB) LoadAllowedSet(ctx context.Context) (map[string]struct{}, error) {
+	rows, err := d.conn.QueryContext(ctx, "SELECT pubkey FROM allowed_pubkeys")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]struct{})
+	for rows.Next() {
+		var pk string
+		if err := rows.Scan(&pk); err != nil {
+			return nil, err
+		}
+		out[pk] = struct{}{}
+	}
+	return out, rows.Err()
+}
+
+// MarkFetched records that a priority-crawl pubkey was just fetched (used by
+// the per-pubkey crawler for last_fetched visibility). tier is preserved.
+func (d *DB) MarkFetched(ctx context.Context, pubkey string) error {
+	now := time.Now().Unix()
+	_, err := d.conn.ExecContext(ctx, `
+INSERT INTO crawl_state(pubkey, last_fetched, tier, updated_at)
+VALUES(?, ?, COALESCE((SELECT tier FROM crawl_state WHERE pubkey = ?), 0), ?)
+ON CONFLICT(pubkey) DO UPDATE SET last_fetched = excluded.last_fetched, updated_at = excluded.updated_at`,
+		pubkey, now, pubkey, now)
+	return err
 }

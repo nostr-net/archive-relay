@@ -71,3 +71,96 @@ func TestPruneSeenOnlyAffectsOldRows(t *testing.T) {
 		t.Error("fresh row should still be present (reported as seen)")
 	}
 }
+
+func TestAllowedPubkeysCRUD(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+
+	if err := db.AllowPubkey(ctx, "alice", "customer #1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AllowPubkey(ctx, "bob", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	set, err := db.LoadAllowedSet(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(set) != 2 {
+		t.Fatalf("LoadAllowedSet = %+v, want 2 keys", set)
+	}
+	for _, k := range []string{"alice", "bob"} {
+		if _, ok := set[k]; !ok {
+			t.Errorf("LoadAllowedSet missing %q: %+v", k, set)
+		}
+	}
+
+	rows, err := db.ListAllowed(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("ListAllowed returned %d rows, want 2", len(rows))
+	}
+	// AllowPubkey is idempotent (INSERT OR REPLACE): re-allowing alice updates, not duplicates.
+	if err := db.AllowPubkey(ctx, "alice", "customer #1 (paid)"); err != nil {
+		t.Fatal(err)
+	}
+	rows, _ = db.ListAllowed(ctx)
+	if len(rows) != 2 {
+		t.Errorf("after re-allow, %d rows, want 2", len(rows))
+	}
+
+	if err := db.RevokePubkey(ctx, "bob"); err != nil {
+		t.Fatal(err)
+	}
+	set, _ = db.LoadAllowedSet(ctx)
+	if _, ok := set["bob"]; ok || len(set) != 1 {
+		t.Errorf("after revoke, set = %+v, want only alice", set)
+	}
+
+	// revoking a missing key is a no-op (no error)
+	if err := db.RevokePubkey(ctx, "nobody"); err != nil {
+		t.Errorf("revoking missing key should be a no-op, got %v", err)
+	}
+}
+
+func TestMarkFetchedPreservesTier(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+
+	if err := db.MarkFetched(ctx, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	var last1, tier int64
+	if err := db.Conn().QueryRowContext(ctx,
+		"SELECT last_fetched, tier FROM crawl_state WHERE pubkey = ?", "alice").Scan(&last1, &tier); err != nil {
+		t.Fatal(err)
+	}
+	if last1 == 0 || tier != 0 {
+		t.Errorf("after first MarkFetched: last_fetched=%d tier=%d", last1, tier)
+	}
+
+	// bump tier manually, then MarkFetched again — tier must be preserved.
+	if _, err := db.Conn().ExecContext(ctx,
+		"UPDATE crawl_state SET tier = 5 WHERE pubkey = ?", "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkFetched(ctx, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	var last2 int64
+	if err := db.Conn().QueryRowContext(ctx,
+		"SELECT last_fetched, tier FROM crawl_state WHERE pubkey = ?", "alice").Scan(&last2, &tier); err != nil {
+		t.Fatal(err)
+	}
+	// last_fetched is Unix-second granularity, so an immediate re-mark may tie;
+	// it must never go backwards.
+	if last2 < last1 {
+		t.Errorf("last_fetched went backwards: %d -> %d", last1, last2)
+	}
+	if tier != 5 {
+		t.Errorf("MarkFetched clobbered tier: got %d, want 5", tier)
+	}
+}

@@ -2,10 +2,14 @@ package relay
 
 import (
 	"context"
+	"io"
+	"log/slog"
+	"path/filepath"
 	"testing"
 
 	"github.com/nbd-wtf/go-nostr"
 
+	"github.com/nostr-net/archive-relay/internal/control"
 	"github.com/nostr-net/archive-relay/internal/policy"
 )
 
@@ -50,8 +54,6 @@ func TestBreadthHookWired(t *testing.T) {
 	breadth := policy.RejectFilterBreadth{MaxKinds: 2}
 	rl := New(Deps{Breadth: breadth})
 
-	// find a RejectFilter hook that rejects an over-limit filter; the breadth
-	// hook is the one that cares about kinds.
 	overLimit := nostr.Filter{Kinds: []int{1, 2, 3}}
 	var found bool
 	for _, fn := range rl.RejectFilter {
@@ -62,5 +64,78 @@ func TestBreadthHookWired(t *testing.T) {
 	}
 	if !found {
 		t.Error("no RejectFilter hook rejected an over-limit kinds filter; breadth hook not wired")
+	}
+}
+
+// --- auth + NIP-86 ---
+
+func newEnabledAccess(t *testing.T) *policy.Access {
+	t.Helper()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	db, err := control.Open(filepath.Join(t.TempDir(), "c.db"), log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	a, err := policy.NewAccess(true, []string{"allowed-pk"}, []string{"admin-pk"}, db, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a
+}
+
+func TestAuthHooksWiredWhenEnabled(t *testing.T) {
+	a := newEnabledAccess(t)
+	rl := New(Deps{Access: a, ServiceURL: "wss://relay.example.com"})
+
+	// NIP-42 advertised and ServiceURL propagated (khatru needs it for validation)
+	if rl.ServiceURL != "wss://relay.example.com" {
+		t.Errorf("ServiceURL = %q, want wss://relay.example.com", rl.ServiceURL)
+	}
+	has42 := false
+	for _, n := range rl.Info.SupportedNIPs {
+		if n.(int) == 42 {
+			has42 = true
+		}
+	}
+	if !has42 {
+		t.Error("NIP-42 should be advertised when ServiceURL is set")
+	}
+
+	// NIP-86 management handlers wired
+	if rl.ManagementAPI.AllowPubKey == nil || rl.ManagementAPI.ListAllowedPubKeys == nil ||
+		rl.ManagementAPI.BanPubKey == nil || len(rl.ManagementAPI.RejectAPICall) == 0 {
+		t.Error("NIP-86 management API + admin gate should be wired when Access is set")
+	}
+}
+
+func TestAuthHooksAbsentWhenAccessNil(t *testing.T) {
+	rl := New(Deps{Breadth: policy.RejectFilterBreadth{}})
+	if rl.ManagementAPI.AllowPubKey != nil {
+		t.Error("ManagementAPI should not be wired when Access is nil")
+	}
+	has42 := false
+	for _, n := range rl.Info.SupportedNIPs {
+		if n.(int) == 42 {
+			has42 = true
+		}
+	}
+	if has42 {
+		t.Error("NIP-42 should not be advertised without ServiceURL")
+	}
+}
+
+func TestManagementAPIAllowEnrolls(t *testing.T) {
+	a := newEnabledAccess(t)
+	rl := New(Deps{Access: a, ServiceURL: "wss://relay.example.com"})
+
+	if err := rl.ManagementAPI.AllowPubKey(context.Background(), "new-customer", "paid"); err != nil {
+		t.Fatal(err)
+	}
+	if !a.Allowed("new-customer") {
+		t.Error("AllowPubKey via the NIP-86 handler should enroll the pubkey")
+	}
+	if !a.Allowed("allowed-pk") {
+		t.Error("static config key should still be allowed")
 	}
 }

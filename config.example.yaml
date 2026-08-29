@@ -33,3 +33,16 @@ retention:                # per-tier TTL DELETE interval; empty = keep forever
 # classifier:
 #   5: permanent          # store NIP-09 deletion events as data
 #   30023: archive        # long-form articles
+
+crawler:
+  priorityPubkeys: []          # pubkeys whose full in-scope history is fetched on schedule
+  relays: []                   # relays used ONLY for the priority crawl (not -sources)
+  interval: 10m                # priority crawl cadence
+
+auth:
+  enabled: false               # gate publish+read behind NIP-42 + the allow-list
+  allowPubkeys: []             # static always-allowed keys (you, friends); read-only via NIP-86
+  adminPubkeys: []             # may call the NIP-86 management RPC (allow/ban/list)
+  # when enabled, relay.serviceURL MUST be set (it's part of the signed AUTH event).
+  # paying customers are added to the SQLite allowed_pubkeys table via NIP-86
+  # (or the freedompay purchase webhook).

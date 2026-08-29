@@ -62,9 +62,23 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	// Crawler: ingest from upstream relays (idempotent via SQLite seen_events).
-	cr := crawler.New(splitSources(*sources), s, cdb, log.With("pkg", "crawler"))
+	// Shared dedup layer for every ingestion path (firehose + priority crawl).
+	// Durable dedup state (seen_events) is recorded only after a batch is flushed
+	// to ClickHouse, so a crash never marks an event "seen" before it's stored.
+	dedup := crawler.NewDedup(cdb)
+	s.SetOnFlushed(dedup.OnFlushed)
+
+	// Firehose crawler: subscribe to in-scope kinds from the -sources relays.
+	cr := crawler.New(splitSources(*sources), s, dedup, log.With("pkg", "crawler"))
 	go cr.Run(ctx)
+
+	// Priority crawler (separate relay list): actively fetch the full in-scope
+	// history of a configured pubkey set so their events are never missed.
+	if len(cfg.Crawler.PriorityPubkeys) > 0 || len(cfg.Crawler.Relays) > 0 {
+		pc := crawler.NewPriority(cfg.Crawler.PriorityPubkeys, cfg.Crawler.Relays,
+			s, dedup, cdb, cfg.Crawler.Interval, log.With("pkg", "priority"))
+		go pc.Run(ctx)
+	}
 
 	// Stats: periodic refresh of snapshot tables.
 	svc := stats.New(s.CH(), log.With("pkg", "stats"))
@@ -79,13 +93,35 @@ func main() {
 		MaxIDs: cfg.Policy.MaxIDs, MaxAuthors: cfg.Policy.MaxAuthors,
 		MaxKinds: cfg.Policy.MaxKinds, MaxTags: cfg.Policy.MaxTags,
 	}
+
+	// Access control: NIP-42 AUTH + pubkey allow-list (static config ∪ SQLite
+	// allowed_pubkeys). When enabled, relay.serviceURL MUST be set — it's part
+	// of the signed AUTH event khatru validates against.
+	var access *policy.Access
+	if cfg.Auth.Enabled {
+		if cfg.Relay.ServiceURL == "" {
+			log.Error("auth.enabled requires relay.serviceURL (set the canonical relay URL)")
+			os.Exit(1)
+		}
+		access, err = policy.NewAccess(true, cfg.Auth.AllowPubkeys, cfg.Auth.AdminPubkeys,
+			cdb, log.With("pkg", "access"))
+		if err != nil {
+			log.Error("access init failed", "err", err)
+			os.Exit(1)
+		}
+		go refreshLoop(ctx, access, 30*time.Second)
+	}
+
 	sched := scheduler.New(cdb.Conn(),
 		func(ctx context.Context, evt *nostr.Event) error {
 			_, err := rl.AddEvent(ctx, evt)
 			return err
 		},
 		60*time.Second, log.With("pkg", "scheduler"))
-	rl = relay.New(relay.Deps{Store: s, Sched: sched, WoT: wot, Limiter: limiter, Breadth: breadth})
+	rl = relay.New(relay.Deps{
+		Store: s, Sched: sched, WoT: wot, Limiter: limiter, Breadth: breadth,
+		Access: access, ServiceURL: cfg.Relay.ServiceURL,
+	})
 	go sched.Run(ctx)
 
 	api.NewHandler(svc, s, limiter, log.With("pkg", "api")).Register(rl.Router())
@@ -112,10 +148,26 @@ func main() {
 	}()
 
 	log.Info("archive relay listening",
-		"addr", cfg.Relay.Addr, "ch", cfg.ClickHouse.Addr, "sources", *sources)
+		"addr", cfg.Relay.Addr, "ch", cfg.ClickHouse.Addr, "sources", *sources,
+		"priority", len(cfg.Crawler.PriorityPubkeys) > 0, "auth", cfg.Auth.Enabled)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Error("server error", "err", err)
 		os.Exit(1)
+	}
+}
+
+// refreshLoop periodically reloads the dynamic allow-list from SQLite so external
+// writes (a billing script, the freedompay webhook) take effect without a restart.
+func refreshLoop(ctx context.Context, a *policy.Access, every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			a.Refresh(ctx)
+		}
 	}
 }
 
