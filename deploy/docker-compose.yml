@@ -3,8 +3,13 @@
 # Then run: ./archive-relay
 services:
   clickhouse:
-    image: clickhouse/clickhouse-server:24.8
+    image: clickhouse/clickhouse-server:26.3
     container_name: archive-relay-ch
+    # 26.x requires a password for the default user unless SKIP_USER_SETUP is
+    # set. Dev/CI convenience only — for production set a real password
+    # (CLICKHOUSE_PASSWORD) and use it in config.yaml.
+    environment:
+      - CLICKHOUSE_SKIP_USER_SETUP=1
     ports:
       - "9000:9000"   # native protocol (what the relay uses)
       - "8123:8123"   # HTTP (useful for ad-hoc queries / clickhouse-client)

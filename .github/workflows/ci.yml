@@ -25,11 +25,13 @@ jobs:
     runs-on: ubuntu-latest
     services:
       clickhouse:
-        image: clickhouse/clickhouse-server:24.8
+        image: clickhouse/clickhouse-server:26.3
         ports:
           - '9000:9000'
           - '8123:8123'
+        # 26.x requires a password by default; skip for CI (dev-style, empty password)
         options: >-
+          --env CLICKHOUSE_SKIP_USER_SETUP=1
           --health-cmd "wget --spider -q http://localhost:8123/ping || exit 1"
           --health-interval 5s
           --health-timeout 3s
