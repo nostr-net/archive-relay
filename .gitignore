@@ -23,3 +23,5 @@ IMPLEMENTATION_PLAN.md
 # env / secrets
 .env
 .env.*
+
+.planning/debug/
