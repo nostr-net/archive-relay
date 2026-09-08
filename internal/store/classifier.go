@@ -7,15 +7,14 @@ const (
 	TierPermanent = "permanent"
 	TierArchive   = "archive"
 	TierSocial    = "social"
-	TierTransient = "transient"
 	TierDrop      = "drop" // never stored
 )
 
 // activeTiers is the set of tiers that receive events (have batchers).
-var activeTiers = []string{TierPermanent, TierArchive, TierSocial, TierTransient}
+var activeTiers = []string{TierPermanent, TierArchive, TierSocial}
 
 // TierForKind is the exported scope check used by the policy layer and others.
-// Returns the tier name (permanent|archive|social|transient|drop).
+// Returns the tier name (permanent|archive|social|drop).
 func TierForKind(kind int) string { return classify(kind) }
 
 // InScopeKinds is the list of kinds this relay stores, used by the crawler to

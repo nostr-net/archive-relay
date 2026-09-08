@@ -20,7 +20,8 @@ test-unit:
 	go test ./...
 
 # Integration tests need ClickHouse on $$CH_ADDR (default localhost:9000).
-# Excludes internal/crawler (hits live relay.nostr.net — run that one by hand).
+# Excludes internal/crawler (its one test hits a live relay, env-overridable
+# via CRAWLER_SOURCE — run it by hand).
 test-integration:
 	go test -tags=integration -count=1 -timeout 120s ./internal/store/ ./internal/stats/ ./internal/e2e/
 

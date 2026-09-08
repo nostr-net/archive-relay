@@ -62,7 +62,7 @@ func (s *Store) Init() error {
 		return err
 	}
 
-	// start one batcher per active tier (transient is idle until kinds map to it)
+	// start one batcher per active tier
 	s.tiers = make(map[string]*batcher, len(activeTiers))
 	for _, t := range activeTiers {
 		b := newBatcher(conn, t, s.cfg.Batch.MaxSize, s.cfg.Batch.MaxAge, s.log.With("tier", t))
@@ -74,7 +74,7 @@ func (s *Store) Init() error {
 }
 
 // FlushAll synchronously flushes every tier's batch buffer into ClickHouse.
-// Used by tests, the scheduler, and a future graceful-SIGTERM drain.
+// Used by tests (and a future graceful-SIGTERM drain).
 func (s *Store) FlushAll() {
 	for _, b := range s.tiers {
 		b.FlushAll()
@@ -88,9 +88,10 @@ func (s *Store) CH() driver.Conn { return s.ch }
 // SetOnFlushed registers a callback fired after a batch is durably written to
 // ClickHouse on ANY tier. Used by the crawler to record durable dedup state
 // only after the data is safe — never mark an event "seen" before it is stored.
+// Safe to call at any time (the callback is stored atomically).
 func (s *Store) SetOnFlushed(fn func(events []*nostr.Event)) {
 	for _, b := range s.tiers {
-		b.OnFlushed = fn
+		b.onFlushed.Store(&fn)
 	}
 }
 

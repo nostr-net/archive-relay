@@ -43,7 +43,7 @@ relay: {addr: ":9999", serviceURL: "wss://relay.example.com"}
 clickhouse: {addr: "ch:9000", database: "x", username: "u", password: "p"}
 sqlite: {path: "/data/c.db"}
 batch: {maxSize: 7, maxAge: 250ms}
-retention: {permanent: "", archive: "5 YEAR", social: "6 MONTH", transient: "7 DAY"}
+retention: {permanent: "", archive: "5 YEAR", social: "6 MONTH"}
 policy: {maxIDs: 5, maxAuthors: 6, maxKinds: 7, maxTags: 8}
 classifier: {5: permanent}
 `)
@@ -67,8 +67,7 @@ classifier: {5: permanent}
 	if c.Batch.MaxSize != 7 || c.Batch.MaxAge != 250*time.Millisecond {
 		t.Errorf("batch override not applied: %+v", c.Batch)
 	}
-	if c.Retention.Archive != "5 YEAR" || c.Retention.Social != "6 MONTH" ||
-		c.Retention.Transient != "7 DAY" {
+	if c.Retention.Archive != "5 YEAR" || c.Retention.Social != "6 MONTH" {
 		t.Errorf("retention override not applied: %+v", c.Retention)
 	}
 	if c.Policy.MaxIDs != 5 || c.Policy.MaxAuthors != 6 ||

@@ -16,7 +16,6 @@ import (
 type Deps struct {
 	Store      *store.Store
 	Sched      *scheduler.Scheduler       // nil to disable future-dating
-	WoT        *policy.WoT                // nil (or Threshold 0) to disable read-time WoT
 	Limiter    *policy.Limiter            // nil to disable per-IP rate limiting
 	Breadth    policy.RejectFilterBreadth // zero-value fields disable that limit
 	Access     *policy.Access             // nil to disable NIP-42 + allow-list
@@ -34,13 +33,18 @@ func New(d Deps) *khatru.Relay {
 	rl.Info.SupportedNIPs = []any{1, 9, 11, 12, 15, 45}
 	if d.ServiceURL != "" {
 		rl.ServiceURL = d.ServiceURL
-		rl.Info.SupportedNIPs = append(rl.Info.SupportedNIPs, 42) // NIP-42 AUTH
+	}
+	// Advertise auth-dependent NIPs only when they're actually enforced — a
+	// bare serviceURL must not imply NIP-42 support.
+	authEnabled := d.Access != nil && d.Access.Enabled()
+	if authEnabled {
+		rl.Info.SupportedNIPs = append(rl.Info.SupportedNIPs, 42, 86) // AUTH + management RPC
 	}
 
 	// --- ingress gates ---
 	// auth (if enabled) runs first so an unauthed client gets the AUTH challenge
 	// before any scope/rate-limit reason is reported.
-	if d.Access != nil && d.Access.Enabled() {
+	if authEnabled {
 		rl.RejectEvent = prepend(rl.RejectEvent, d.Access.RejectEvent)
 	}
 	rl.RejectEvent = append(rl.RejectEvent, policy.RejectOutOfScope)
@@ -65,18 +69,14 @@ func New(d Deps) *khatru.Relay {
 	rl.ReplaceEvent = append(rl.ReplaceEvent, d.Store.ReplaceEvent)
 	rl.DeleteEvent = append(rl.DeleteEvent, d.Store.DeleteEvent)
 
-	// --- reads (optionally filtered by read-time WoT) ---
-	query := d.Store.QueryEvents
-	if d.WoT != nil {
-		query = d.WoT.WrapQuery(d.Store.QueryEvents)
-	}
-	rl.QueryEvents = append(rl.QueryEvents, query)
+	// --- reads ---
+	rl.QueryEvents = append(rl.QueryEvents, d.Store.QueryEvents)
 	rl.CountEvents = append(rl.CountEvents, d.Store.CountEvents)
 
 	// --- egress gates ---
 	// auth first (auth-required challenge), then per-IP read rate limit, then
 	// REQ-breadth caps — so a hostile client can't force large FINAL scans.
-	if d.Access != nil && d.Access.Enabled() {
+	if authEnabled {
 		rl.RejectFilter = prepend(rl.RejectFilter, d.Access.RejectFilter)
 		rl.RejectCountFilter = prepend(rl.RejectCountFilter, d.Access.RejectFilter)
 	}

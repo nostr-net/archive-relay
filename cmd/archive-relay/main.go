@@ -11,6 +11,7 @@ import (
 	_ "net/http/pprof" // registers /debug/pprof handlers on http.DefaultServeMux
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -64,8 +65,12 @@ func main() {
 
 	// Shared dedup layer for every ingestion path (firehose + priority crawl).
 	// Durable dedup state (seen_events) is recorded only after a batch is flushed
-	// to ClickHouse, so a crash never marks an event "seen" before it's stored.
-	dedup := crawler.NewDedup(cdb)
+	// to ClickHouse, so a crash never marks an event "seen" before it's stored;
+	// Warm preloads the recent ids so a restart doesn't re-ingest the firehose.
+	dedup := crawler.NewDedup(cdb, log.With("pkg", "dedup"))
+	if err := dedup.Warm(ctx); err != nil {
+		log.Warn("dedup warm failed (starting cold)", "err", err)
+	}
 	s.SetOnFlushed(dedup.OnFlushed)
 
 	// Firehose crawler: subscribe to in-scope kinds from the -sources relays.
@@ -87,8 +92,7 @@ func main() {
 	// Forward-declare the relay so the scheduler's publish closure can capture it.
 	// The closure is only invoked from sched.Run (goroutine), by which point rl is set.
 	var rl *khatru.Relay
-	wot := &policy.WoT{Lookup: svc.Followers, Threshold: 0} // Threshold 0 = WoT disabled; set >0 to gate reads
-	limiter := policy.NewLimiter(600)                       // per-IP events/reads/REST per minute; tune for your threat model
+	limiter := policy.NewLimiter(600) // per-IP events/reads/REST per minute; tune for your threat model
 	breadth := policy.RejectFilterBreadth{
 		MaxIDs: cfg.Policy.MaxIDs, MaxAuthors: cfg.Policy.MaxAuthors,
 		MaxKinds: cfg.Policy.MaxKinds, MaxTags: cfg.Policy.MaxTags,
@@ -104,7 +108,7 @@ func main() {
 			os.Exit(1)
 		}
 		access, err = policy.NewAccess(true, cfg.Auth.AllowPubkeys, cfg.Auth.AdminPubkeys,
-			cdb, log.With("pkg", "access"))
+			cfg.Relay.ServiceURL, cdb, log.With("pkg", "access"))
 		if err != nil {
 			log.Error("access init failed", "err", err)
 			os.Exit(1)
@@ -112,19 +116,19 @@ func main() {
 		go refreshLoop(ctx, access, 30*time.Second)
 	}
 
-	sched := scheduler.New(cdb.Conn(),
+	sched := scheduler.New(cdb,
 		func(ctx context.Context, evt *nostr.Event) error {
 			_, err := rl.AddEvent(ctx, evt)
 			return err
 		},
 		60*time.Second, log.With("pkg", "scheduler"))
 	rl = relay.New(relay.Deps{
-		Store: s, Sched: sched, WoT: wot, Limiter: limiter, Breadth: breadth,
+		Store: s, Sched: sched, Limiter: limiter, Breadth: breadth,
 		Access: access, ServiceURL: cfg.Relay.ServiceURL,
 	})
 	go sched.Run(ctx)
 
-	api.NewHandler(svc, s, limiter, log.With("pkg", "api")).Register(rl.Router())
+	api.NewHandler(svc, s, limiter, access, log.With("pkg", "api")).Register(rl.Router())
 
 	// Ops profiling (stdlib pprof) on loopback only — never on the public port.
 	// net/http/pprof registers its handlers on http.DefaultServeMux at import.
@@ -140,7 +144,14 @@ func main() {
 		}
 	}()
 
-	srv := &http.Server{Addr: cfg.Relay.Addr, Handler: rl}
+	// Rate-limit the NIP-86 management RPC: khatru dispatches it by
+	// Content-Type on any path (outside the /v1/* route wrapping), and each
+	// unauthenticated attempt costs a ReadAll + base64 + schnorr verify.
+	handler := limiter.HTTPWhen(
+		func(r *http.Request) bool {
+			return r.Header.Get("Content-Type") == "application/nostr+json+rpc"
+		}, rl)
+	srv := &http.Server{Addr: cfg.Relay.Addr, Handler: handler}
 	go func() {
 		<-ctx.Done()
 		log.Info("shutting down")
@@ -173,19 +184,10 @@ func refreshLoop(ctx context.Context, a *policy.Access, every time.Duration) {
 
 func splitSources(s string) []string {
 	var out []string
-	cur := ""
-	for _, r := range s {
-		if r == ',' {
-			if cur != "" {
-				out = append(out, cur)
-			}
-			cur = ""
-		} else {
-			cur += string(r)
+	for _, v := range strings.Split(s, ",") {
+		if v = strings.TrimSpace(v); v != "" {
+			out = append(out, v)
 		}
-	}
-	if cur != "" {
-		out = append(out, cur)
 	}
 	return out
 }

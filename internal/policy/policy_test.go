@@ -6,7 +6,6 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/nbd-wtf/go-nostr"
 )
@@ -138,47 +137,4 @@ func TestClientIP(t *testing.T) {
 	if got := ClientIP(r3); got != "7.7.7.7" {
 		t.Errorf("ClientIP with only-private XFF = %q, want 7.7.7.7", got)
 	}
-}
-
-// --- web-of-trust read-time filter ---
-
-func TestWoTThreshold(t *testing.T) {
-	lookup := func(_ context.Context, pk string) (int64, error) {
-		if pk == "popular" {
-			return 5, nil
-		}
-		return 0, nil
-	}
-
-	t.Run("filters below threshold", func(t *testing.T) {
-		w := &WoT{Lookup: lookup, Threshold: 1, TTL: time.Minute}
-		if !w.Allows(context.Background(), "popular") {
-			t.Error("author at/above threshold should be allowed")
-		}
-		if w.Allows(context.Background(), "nobody") {
-			t.Error("author below threshold should be filtered out")
-		}
-	})
-
-	t.Run("threshold 0 disables", func(t *testing.T) {
-		w := &WoT{Lookup: lookup, Threshold: 0}
-		if !w.Allows(context.Background(), "nobody") {
-			t.Error("Threshold 0 must disable the filter entirely")
-		}
-	})
-
-	t.Run("caches within TTL", func(t *testing.T) {
-		calls := atomic.Int64{}
-		cachingLookup := func(ctx context.Context, pk string) (int64, error) {
-			calls.Add(1)
-			return lookup(ctx, pk)
-		}
-		w := &WoT{Lookup: cachingLookup, Threshold: 1, TTL: time.Minute}
-		_ = w.Allows(context.Background(), "popular")
-		_ = w.Allows(context.Background(), "popular")
-		_ = w.Allows(context.Background(), "popular")
-		if got := calls.Load(); got != 1 {
-			t.Errorf("lookup called %d times, want 1 (cached within TTL)", got)
-		}
-	})
 }

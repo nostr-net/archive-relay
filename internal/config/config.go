@@ -16,7 +16,7 @@ type Config struct {
 	Batch      Batch      `yaml:"batch"`
 	Retention  Retention  `yaml:"retention"`
 	// Classifier optionally overrides the built-in kind→tier map.
-	// Keys are kind numbers, values are tier names: permanent|archive|social|transient|drop.
+	// Keys are kind numbers, values are tier names: permanent|archive|social|drop.
 	Classifier map[int]string `yaml:"classifier"`
 
 	// Policy caps the breadth of inbound REQ/COUNT filters so a hostile client
@@ -57,7 +57,6 @@ type Retention struct {
 	Permanent string `yaml:"permanent"` // e.g. "" (forever)
 	Archive   string `yaml:"archive"`   // e.g. "10 YEAR"
 	Social    string `yaml:"social"`    // e.g. "1 YEAR"
-	Transient string `yaml:"transient"` // e.g. "30 DAY"
 }
 
 // Policy sets inbound filter-breadth limits enforced at the relay hooks. A zero
@@ -76,7 +75,7 @@ type Policy struct {
 type Crawler struct {
 	PriorityPubkeys []string      `yaml:"priorityPubkeys"` // pubkeys whose events are fetched on schedule
 	Relays          []string      `yaml:"relays"`          // per-pubkey crawl relays
-	Interval        time.Duration `yaml:"interval"`        // crawl cadency
+	Interval        time.Duration `yaml:"interval"`        // crawl cadence
 }
 
 // Auth enables NIP-42 AUTH + a pubkey allow-list. When Enabled, only pubkeys in
@@ -113,7 +112,7 @@ func defaults() *Config {
 		// ClickHouse small-inserts anti-pattern). 5s/5000 coalesces into few,
 		// large parts. Dev/tests override these explicitly.
 		Batch:     Batch{MaxSize: 5000, MaxAge: 5 * time.Second},
-		Retention: Retention{Archive: "10 YEAR", Social: "1 YEAR", Transient: "30 DAY"},
+		Retention: Retention{Archive: "10 YEAR", Social: "1 YEAR"},
 		Policy:    Policy{MaxIDs: 1000, MaxAuthors: 1000, MaxKinds: 20, MaxTags: 256},
 		Crawler:   Crawler{Interval: 10 * time.Minute},
 	}

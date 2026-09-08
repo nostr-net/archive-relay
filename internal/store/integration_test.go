@@ -66,7 +66,7 @@ func setupStore(t *testing.T) (*Store, *control.DB, func()) {
 	cfg := &config.Config{
 		ClickHouse: config.ClickHouse{Addr: chAddr, Database: testDB, Username: "default"},
 		Batch:      config.Batch{MaxSize: 50, MaxAge: 200 * time.Millisecond},
-		Retention:  config.Retention{Archive: "10 YEAR", Social: "1 YEAR", Transient: "30 DAY"},
+		Retention:  config.Retention{Archive: "10 YEAR", Social: "1 YEAR"},
 	}
 	s := New(cfg, log)
 	if err := s.Init(); err != nil {

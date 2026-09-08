@@ -37,6 +37,17 @@ Key knobs: `batch.maxSize`/`maxAge` (insert coalescing), per-tier `retention.*`
 TTL, `policy.*` REQ-breadth limits, and an optional `classifier` map to override
 kind→tier without recompiling. Crawler sources are the `-sources` flag.
 
+Two optional subsystems:
+
+- **`crawler.*`** — a per-pubkey *priority* crawl: `crawler.priorityPubkeys` are
+  fetched from `crawler.relays` every `crawler.interval` (incremental, with a
+  periodic full-history sweep) so their in-scope events are never missed.
+- **`auth.*`** — `auth.enabled` gates publish+read behind NIP-42 AUTH plus a
+  pubkey allow-list (static `auth.allowPubkeys` ∪ the `allowed_pubkeys` table,
+  managed by `auth.adminPubkeys` over the NIP-86 RPC). Requires
+  `relay.serviceURL`. When enabled, the `/v1/*` REST API also requires a NIP-98
+  signed request from an allow-listed pubkey (`/v1/health` stays open).
+
 ## Test
 
 ```bash

@@ -7,7 +7,6 @@ package crawler
 import (
 	"context"
 	"log/slog"
-	"math"
 	"sync"
 	"time"
 
@@ -38,7 +37,8 @@ func (c *Crawler) Run(ctx context.Context) {
 		return
 	}
 	// Prune the dedup table hourly so it doesn't grow unbounded. seen_events is
-	// only useful for the backfill window; older rows are dead weight.
+	// only useful for restart-warm and the backfill window; older rows are dead
+	// weight.
 	go c.pruneLoop(ctx, time.Hour, 7*24*time.Hour)
 
 	kinds := store.InScopeKinds()
@@ -142,10 +142,7 @@ func sleepCtx(ctx context.Context, d time.Duration) {
 func nextBackoff(d time.Duration) time.Duration {
 	d *= 2
 	if d > 60*time.Second {
-		d = 60 * time.Second
-	}
-	if d < 0 || math.IsInf(float64(d), 0) {
-		d = 60 * time.Second
+		return 60 * time.Second
 	}
 	return d
 }

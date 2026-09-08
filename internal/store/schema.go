@@ -60,8 +60,7 @@ func eventsViewDDL() string {
 CREATE OR REPLACE VIEW events_all AS
   SELECT * FROM events_permanent
   UNION ALL SELECT * FROM events_archive
-  UNION ALL SELECT * FROM events_social
-  UNION ALL SELECT * FROM events_transient;
+  UNION ALL SELECT * FROM events_social;
 `
 }
 
@@ -111,7 +110,7 @@ CREATE TABLE IF NOT EXISTS stats_daily_active (
 CREATE TABLE IF NOT EXISTS author_follower_counts (
   pubkey    String,
   followers UInt64
-) ENGINE = ReplacingMergeTree ORDER BY pubkey;
+) ENGINE = MergeTree ORDER BY pubkey;
 `
 
 // initSchema runs all DDL idempotently.
@@ -120,7 +119,6 @@ func (s *Store) initSchema(ctx context.Context) error {
 		TierPermanent: s.cfg.Retention.Permanent,
 		TierArchive:   s.cfg.Retention.Archive,
 		TierSocial:    s.cfg.Retention.Social,
-		TierTransient: s.cfg.Retention.Transient,
 	}
 	stmts := []string{}
 	for _, t := range activeTiers {

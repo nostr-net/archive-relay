@@ -66,10 +66,9 @@ func (s *Service) refreshAll(ctx context.Context) {
 }
 
 // RefreshFollowers recomputes per-author follower counts from the latest kind-3
-// contact list of each author. author_follower_counts is ReplacingMergeTree so
-// we REPLACE INTO (delete old + insert).
+// contact list of each author: TRUNCATE then repopulate (cheap relative to the
+// scan), so the table engine can be a plain MergeTree.
 func (s *Service) RefreshFollowers(ctx context.Context) error {
-	// TRUNCATE then repopulate; cheap relative to the scan.
 	if err := s.ch.Exec(ctx, "TRUNCATE TABLE author_follower_counts"); err != nil {
 		return fmt.Errorf("truncate: %w", err)
 	}
@@ -217,7 +216,7 @@ func (s *Service) DAU(ctx context.Context, days int) ([]DAURow, error) {
 func (s *Service) Followers(ctx context.Context, pubkey string) (int64, error) {
 	var n uint64
 	err := s.ch.QueryRow(ctx,
-		`SELECT followers FROM author_follower_counts FINAL WHERE pubkey = ?`, pubkey).Scan(&n)
+		`SELECT followers FROM author_follower_counts WHERE pubkey = ?`, pubkey).Scan(&n)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return 0, nil

@@ -2,7 +2,13 @@ package policy
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"log/slog"
+	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 
 	"github.com/fiatjaf/khatru"
@@ -24,9 +30,10 @@ import (
 // Refresh (so external DB writes are picked up) and after every in-process
 // mutation.
 type Access struct {
-	enabled bool
-	admin   map[string]struct{} // NIP-86 management callers
-	static  map[string]struct{} // config allow-list (not in the DB)
+	enabled     bool
+	admin       map[string]struct{} // NIP-86 management callers
+	static      map[string]struct{} // config allow-list (not in the DB)
+	serviceHost string              // hostname of the configured serviceURL ("" = unbound)
 
 	mu      sync.RWMutex
 	allowed map[string]struct{} // effective union (static ∪ dynamic)
@@ -36,14 +43,22 @@ type Access struct {
 }
 
 // NewAccess loads the static config sets and primes the union from the DB.
-func NewAccess(enabled bool, allow, admin []string, ctrl *control.DB, log *slog.Logger) (*Access, error) {
+// serviceURL is the canonical relay URL; its hostname binds the NIP-98 `u` tag
+// on HTTP requests to this relay (empty disables host binding).
+func NewAccess(enabled bool, allow, admin []string, serviceURL string,
+	ctrl *control.DB, log *slog.Logger) (*Access, error) {
+	host := ""
+	if u, err := url.Parse(serviceURL); err == nil {
+		host = u.Hostname()
+	}
 	a := &Access{
-		enabled: enabled,
-		admin:   toSet(admin),
-		static:  toSet(allow),
-		allowed: make(map[string]struct{}),
-		ctrl:    ctrl,
-		log:     log,
+		enabled:     enabled,
+		admin:       toSet(admin),
+		static:      toSet(allow),
+		serviceHost: host,
+		allowed:     make(map[string]struct{}),
+		ctrl:        ctrl,
+		log:         log,
 	}
 	dyn, err := ctrl.LoadAllowedSet(context.Background())
 	if err != nil {
@@ -125,6 +140,83 @@ func (a *Access) RejectEvent(ctx context.Context, _ *nostr.Event) (bool, string)
 // signature (reads).
 func (a *Access) RejectFilter(ctx context.Context, _ nostr.Filter) (bool, string) {
 	return a.gate(ctx)
+}
+
+// httpAuthWindow is the allowed clock skew for a NIP-98 auth event.
+const httpAuthWindow = 60 // seconds
+
+// HTTPAuth gates an HTTP endpoint behind the same allow-list, using NIP-98:
+// the client sends `Authorization: Nostr <base64 kind-27235 event>` whose `u`
+// tag must point at the request path and whose pubkey must be allow-listed.
+// When the Access is disabled it passes everything through.
+func (a *Access) HTTPAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !a.enabled {
+			next.ServeHTTP(w, r)
+			return
+		}
+		pk, err := a.httpAuthPubkey(r)
+		if err != nil {
+			// WWW-Authenticate lets clients auto-negotiate the Nostr scheme.
+			w.Header().Set("WWW-Authenticate", "Nostr")
+			http.Error(w, "unauthorized: "+err.Error(), http.StatusUnauthorized)
+			return
+		}
+		if !a.Allowed(pk) {
+			http.Error(w, "forbidden: pubkey is not on the allow-list", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// httpAuthPubkey extracts and validates the NIP-98 auth event from the request,
+// returning the signing pubkey. Checks: Authorization scheme, kind 27235,
+// `u` tag path matches the request path, `u` tag host matches the configured
+// serviceURL host when both are known (the relay may sit behind a TLS proxy, so
+// an unconfigured host skips the check rather than false-rejecting), `method`
+// tag matches when present, created_at within httpAuthWindow, and a valid
+// signature. (No `payload` check: the REST API is GET-only, so there's no body
+// to bind.)
+func (a *Access) httpAuthPubkey(r *http.Request) (string, error) {
+	b64, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Nostr ")
+	if !ok {
+		return "", errors.New("missing 'Authorization: Nostr <base64 event>'")
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(b64))
+	if err != nil {
+		return "", errors.New("invalid base64 auth event")
+	}
+	var evt nostr.Event
+	if err := json.Unmarshal(raw, &evt); err != nil {
+		return "", errors.New("invalid auth event JSON")
+	}
+	if evt.Kind != nostr.KindHTTPAuth {
+		return "", errors.New("auth event must be kind 27235")
+	}
+	uTag := evt.Tags.Find("u")
+	if uTag == nil {
+		return "", errors.New("auth event missing 'u' tag")
+	}
+	parsed, err := url.Parse(uTag[1])
+	if err != nil || parsed.Path != r.URL.Path {
+		return "", errors.New("'u' tag does not match request path")
+	}
+	if h := parsed.Hostname(); h != "" && a.serviceHost != "" &&
+		!strings.EqualFold(h, a.serviceHost) {
+		return "", errors.New("'u' tag host does not match this relay")
+	}
+	if mTag := evt.Tags.Find("method"); mTag != nil && !strings.EqualFold(mTag[1], r.Method) {
+		return "", errors.New("'method' tag does not match request method")
+	}
+	now := nostr.Now()
+	if evt.CreatedAt > now+httpAuthWindow || evt.CreatedAt < now-httpAuthWindow {
+		return "", errors.New("auth event is stale or future-dated")
+	}
+	if ok, _ := evt.CheckSignature(); !ok {
+		return "", errors.New("invalid auth event signature")
+	}
+	return evt.PubKey, nil
 }
 
 // --- mutations (used by NIP-86; update DB + cache together) ---

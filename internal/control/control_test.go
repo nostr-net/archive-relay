@@ -126,41 +126,32 @@ func TestAllowedPubkeysCRUD(t *testing.T) {
 	}
 }
 
-func TestMarkFetchedPreservesTier(t *testing.T) {
+func TestMarkFetchedUpserts(t *testing.T) {
 	db := testDB(t)
 	ctx := context.Background()
 
 	if err := db.MarkFetched(ctx, "alice"); err != nil {
 		t.Fatal(err)
 	}
-	var last1, tier int64
-	if err := db.Conn().QueryRowContext(ctx,
-		"SELECT last_fetched, tier FROM crawl_state WHERE pubkey = ?", "alice").Scan(&last1, &tier); err != nil {
+	var last1 int64
+	if err := db.conn.QueryRowContext(ctx,
+		"SELECT last_fetched FROM crawl_state WHERE pubkey = ?", "alice").Scan(&last1); err != nil {
 		t.Fatal(err)
 	}
-	if last1 == 0 || tier != 0 {
-		t.Errorf("after first MarkFetched: last_fetched=%d tier=%d", last1, tier)
-	}
-
-	// bump tier manually, then MarkFetched again — tier must be preserved.
-	if _, err := db.Conn().ExecContext(ctx,
-		"UPDATE crawl_state SET tier = 5 WHERE pubkey = ?", "alice"); err != nil {
-		t.Fatal(err)
+	if last1 == 0 {
+		t.Error("MarkFetched should set last_fetched")
 	}
 	if err := db.MarkFetched(ctx, "alice"); err != nil {
 		t.Fatal(err)
 	}
-	var last2 int64
-	if err := db.Conn().QueryRowContext(ctx,
-		"SELECT last_fetched, tier FROM crawl_state WHERE pubkey = ?", "alice").Scan(&last2, &tier); err != nil {
-		t.Fatal(err)
-	}
 	// last_fetched is Unix-second granularity, so an immediate re-mark may tie;
 	// it must never go backwards.
+	var last2 int64
+	if err := db.conn.QueryRowContext(ctx,
+		"SELECT last_fetched FROM crawl_state WHERE pubkey = ?", "alice").Scan(&last2); err != nil {
+		t.Fatal(err)
+	}
 	if last2 < last1 {
 		t.Errorf("last_fetched went backwards: %d -> %d", last1, last2)
-	}
-	if tier != 5 {
-		t.Errorf("MarkFetched clobbered tier: got %d, want 5", tier)
 	}
 }

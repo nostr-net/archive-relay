@@ -23,29 +23,36 @@ type Handler struct {
 	stats   *stats.Service
 	store   *store.Store
 	limiter *policy.Limiter // optional per-IP REST rate limit
+	access  *policy.Access  // optional: when enabled, /v1/* requires NIP-98 + allow-list
 	log     *slog.Logger
 }
 
-// NewHandler constructs the API handler. limiter may be nil.
-func NewHandler(s *stats.Service, st *store.Store, limiter *policy.Limiter, log *slog.Logger) *Handler {
-	return &Handler{stats: s, store: st, limiter: limiter, log: log}
+// NewHandler constructs the API handler. limiter and access may be nil.
+func NewHandler(s *stats.Service, st *store.Store, limiter *policy.Limiter,
+	access *policy.Access, log *slog.Logger) *Handler {
+	return &Handler{stats: s, store: st, limiter: limiter, access: access, log: log}
 }
 
 // Register mounts the API routes on the given mux.
 func (h *Handler) Register(mux *http.ServeMux) {
-	register := func(pattern string, fn http.HandlerFunc) {
+	register := func(pattern string, fn http.HandlerFunc, public bool) {
 		var handler http.Handler = http.HandlerFunc(fn)
+		// auth first in the chain = innermost wrap: rate-limit cheaply, then
+		// pay the NIP-98 signature check only for requests under the limit.
+		if !public && h.access != nil {
+			handler = h.access.HTTPAuth(handler)
+		}
 		if h.limiter != nil {
 			handler = h.limiter.HTTP(handler)
 		}
 		mux.Handle(pattern, handler)
 	}
-	register("/v1/health", h.health)
-	register("/v1/stats/daily", h.daily)
-	register("/v1/stats/dau", h.dau)
-	register("/v1/note/", h.noteEngagement)
-	register("/v1/pubkey/", h.followers)
-	register("/v1/events", h.events)
+	register("/v1/health", h.health, true) // liveness probe stays open
+	register("/v1/stats/daily", h.daily, false)
+	register("/v1/stats/dau", h.dau, false)
+	register("/v1/note/", h.noteEngagement, false)
+	register("/v1/pubkey/", h.followers, false)
+	register("/v1/events", h.events, false)
 }
 
 func (h *Handler) health(w http.ResponseWriter, r *http.Request) {

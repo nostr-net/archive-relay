@@ -64,7 +64,7 @@ func TestCrawlerIngestsFromLiveRelay(t *testing.T) {
 	cfg := &config.Config{
 		ClickHouse: config.ClickHouse{Addr: chAddr, Database: testDB, Username: "default"},
 		Batch:      config.Batch{MaxSize: 500, MaxAge: 500 * time.Millisecond},
-		Retention:  config.Retention{Archive: "10 YEAR", Social: "1 YEAR", Transient: "30 DAY"},
+		Retention:  config.Retention{Archive: "10 YEAR", Social: "1 YEAR"},
 	}
 	s := store.New(cfg, log.With("pkg", "store"))
 	if err := s.Init(); err != nil {
@@ -72,7 +72,7 @@ func TestCrawlerIngestsFromLiveRelay(t *testing.T) {
 	}
 	defer s.Close()
 
-	cr := New([]string{src}, s, NewDedup(cdb), log.With("pkg", "crawler"))
+	cr := New([]string{src}, s, NewDedup(cdb, log.With("pkg", "dedup")), log.With("pkg", "crawler"))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()

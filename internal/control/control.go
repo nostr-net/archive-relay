@@ -1,12 +1,13 @@
 // Package control is the embedded SQLite control plane for the relay: the
 // small mutable, high-frequency-update state that ClickHouse is bad at
-// (crawler queue/progress, scheduled events, auth challenges). It is a
+// (crawler progress, scheduled events, dedup, allow-list). It is a
 // library-backed .db file, NOT a separate server — part of the one binary.
 package control
 
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -18,24 +19,15 @@ const schema = `
 CREATE TABLE IF NOT EXISTS crawl_state (
   pubkey        TEXT PRIMARY KEY,
   last_fetched  INTEGER NOT NULL DEFAULT 0,
-  tier          INTEGER NOT NULL DEFAULT 0,
   updated_at    INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_crawl_state_tier ON crawl_state(tier, last_fetched);
 
 CREATE TABLE IF NOT EXISTS scheduled_events (
   id         TEXT PRIMARY KEY,          -- the future-dated event id
   event_json TEXT NOT NULL,             -- full serialized event
-  publish_at INTEGER NOT NULL,          -- created_at, when to publish
-  taken_by   TEXT                       -- worker lease; NULL = available
+  publish_at INTEGER NOT NULL           -- created_at, when to publish
 );
-CREATE INDEX IF NOT EXISTS idx_scheduled_due ON scheduled_events(publish_at, taken_by);
-
-CREATE TABLE IF NOT EXISTS auth_challenges (
-  challenge TEXT PRIMARY KEY,
-  pubkey    TEXT,
-  created_at INTEGER NOT NULL DEFAULT 0
-);
+CREATE INDEX IF NOT EXISTS idx_scheduled_due ON scheduled_events(publish_at);
 
 CREATE TABLE IF NOT EXISTS seen_events (
   id TEXT PRIMARY KEY,
@@ -74,10 +66,6 @@ func Open(path string, log *slog.Logger) (*DB, error) {
 
 func (d *DB) Close() error { return d.conn.Close() }
 
-// Conn exposes the underlying *sql.DB for subsystems that need direct access
-// (crawler queue with FOR UPDATE SKIP LOCKED semantics, scheduler leases).
-func (d *DB) Conn() *sql.DB { return d.conn }
-
 // MarkSeen records an event id as ingested, for idempotent batcher dedup.
 // Returns true if it was newly inserted (i.e. not seen before).
 func (d *DB) MarkSeen(ctx context.Context, id string, createdAt int64) (bool, error) {
@@ -88,6 +76,59 @@ func (d *DB) MarkSeen(ctx context.Context, id string, createdAt int64) (bool, er
 	}
 	n, _ := res.RowsAffected()
 	return n > 0, nil
+}
+
+// SeenRef is one (id, created_at) pair for a batched MarkSeen.
+type SeenRef struct {
+	ID        string
+	CreatedAt int64
+}
+
+// MarkSeenBatch records many seen ids in a single transaction. Used by the
+// post-flush hook so a whole ClickHouse batch costs one commit, not one
+// autocommit per event.
+func (d *DB) MarkSeenBatch(ctx context.Context, items []SeenRef) error {
+	if len(items) == 0 {
+		return nil
+	}
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmt, err := tx.PrepareContext(ctx,
+		"INSERT OR IGNORE INTO seen_events(id, created_at) VALUES(?, ?)")
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, it := range items {
+		if _, err := stmt.ExecContext(ctx, it.ID, it.CreatedAt); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// LoadRecentSeen returns up to limit most-recently-recorded seen ids (insert
+// order via rowid), used to warm the in-memory dedup cache after a restart so
+// recent events aren't re-ingested.
+func (d *DB) LoadRecentSeen(ctx context.Context, limit int) ([]string, error) {
+	rows, err := d.conn.QueryContext(ctx,
+		"SELECT id FROM seen_events ORDER BY rowid DESC LIMIT ?", limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
 }
 
 // PruneSeen deletes seen_events rows older than maxAge. seen_events is only
@@ -162,14 +203,69 @@ func (d *DB) LoadAllowedSet(ctx context.Context) (map[string]struct{}, error) {
 	return out, rows.Err()
 }
 
+// LastFetched returns the last successful priority-crawl time for a pubkey
+// (0 if the pubkey was never crawled).
+func (d *DB) LastFetched(ctx context.Context, pubkey string) (int64, error) {
+	var ts int64
+	err := d.conn.QueryRowContext(ctx,
+		"SELECT last_fetched FROM crawl_state WHERE pubkey = ?", pubkey).Scan(&ts)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	return ts, err
+}
+
 // MarkFetched records that a priority-crawl pubkey was just fetched (used by
-// the per-pubkey crawler for last_fetched visibility). tier is preserved.
+// the per-pubkey crawler for last_fetched visibility and incremental fetches).
 func (d *DB) MarkFetched(ctx context.Context, pubkey string) error {
 	now := time.Now().Unix()
 	_, err := d.conn.ExecContext(ctx, `
-INSERT INTO crawl_state(pubkey, last_fetched, tier, updated_at)
-VALUES(?, ?, COALESCE((SELECT tier FROM crawl_state WHERE pubkey = ?), 0), ?)
+INSERT INTO crawl_state(pubkey, last_fetched, updated_at) VALUES(?, ?, ?)
 ON CONFLICT(pubkey) DO UPDATE SET last_fetched = excluded.last_fetched, updated_at = excluded.updated_at`,
-		pubkey, now, pubkey, now)
+		pubkey, now, now)
+	return err
+}
+
+// --- scheduled (future-dated) events ---
+
+// SaveScheduled parks (or replaces) a future-dated event row.
+func (d *DB) SaveScheduled(ctx context.Context, id, eventJSON string, publishAt int64) error {
+	_, err := d.conn.ExecContext(ctx,
+		"INSERT OR REPLACE INTO scheduled_events(id, event_json, publish_at) VALUES(?, ?, ?)",
+		id, eventJSON, publishAt)
+	return err
+}
+
+// ScheduledEvent is one parked future-dated event.
+type ScheduledEvent struct {
+	ID        string
+	EventJSON string
+}
+
+// LoadDueScheduled returns up to limit parked events whose publish time has
+// passed, oldest first.
+func (d *DB) LoadDueScheduled(ctx context.Context, now int64, limit int) ([]ScheduledEvent, error) {
+	rows, err := d.conn.QueryContext(ctx,
+		"SELECT id, event_json FROM scheduled_events WHERE publish_at <= ? ORDER BY publish_at LIMIT ?",
+		now, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ScheduledEvent
+	for rows.Next() {
+		var e ScheduledEvent
+		if err := rows.Scan(&e.ID, &e.EventJSON); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// DeleteScheduled removes a parked event (after it was published or proven
+// unloadable).
+func (d *DB) DeleteScheduled(ctx context.Context, id string) error {
+	_, err := d.conn.ExecContext(ctx, "DELETE FROM scheduled_events WHERE id = ?", id)
 	return err
 }

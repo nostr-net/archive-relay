@@ -2,38 +2,30 @@ package scheduler
 
 import (
 	"context"
-	"database/sql"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/nbd-wtf/go-nostr"
 
-	_ "modernc.org/sqlite" // pure-Go SQLite driver
+	"github.com/nostr-net/archive-relay/internal/control"
 )
 
-// openDB creates an in-memory SQLite with just the scheduled_events table.
-func openDB(t *testing.T) *sql.DB {
+// openDB creates a temp-file control DB with the real schema.
+func openDB(t *testing.T) *control.DB {
 	t.Helper()
-	db, err := sql.Open("sqlite", ":memory:")
+	db, err := control.Open(filepath.Join(t.TempDir(), "sched.db"),
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	_, err = db.Exec(`CREATE TABLE scheduled_events (
-		id         TEXT PRIMARY KEY,
-		event_json TEXT NOT NULL,
-		publish_at INTEGER NOT NULL,
-		taken_by   TEXT
-	)`)
-	if err != nil {
-		t.Fatal(err)
-	}
 	return db
 }
 
-func newSched(t *testing.T, db *sql.DB, publish PublishFunc, buffer time.Duration) *Scheduler {
+func newSched(t *testing.T, db *control.DB, publish PublishFunc, buffer time.Duration) *Scheduler {
 	t.Helper()
 	return New(db, publish, buffer, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
@@ -87,12 +79,13 @@ func TestDeferAndPublishDuePublishesOnlyPastEvents(t *testing.T) {
 	}
 
 	// the due event is removed from the table; the future one stays
-	var remaining int
-	if err := db.QueryRow("SELECT COUNT(*) FROM scheduled_events").Scan(&remaining); err != nil {
+	// (a far-future cutoff makes LoadDueScheduled return every parked row)
+	remaining, err := db.LoadDueScheduled(ctx, time.Now().Add(2*time.Hour).Unix(), 100)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if remaining != 1 {
-		t.Errorf("remaining scheduled events = %d, want 1 (the future event)", remaining)
+	if len(remaining) != 1 || remaining[0].ID != "future" {
+		t.Errorf("remaining scheduled events = %+v, want just [future]", remaining)
 	}
 }
 
@@ -108,11 +101,11 @@ func TestDeferIsIdempotent(t *testing.T) {
 	if err := s.Defer(ctx, evt); err != nil {
 		t.Fatal(err)
 	}
-	var n int
-	if err := db.QueryRow("SELECT COUNT(*) FROM scheduled_events").Scan(&n); err != nil {
+	rows, err := db.LoadDueScheduled(ctx, time.Now().Add(2*time.Hour).Unix(), 100)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if n != 1 {
-		t.Errorf("after two Defers of the same id, row count = %d, want 1", n)
+	if len(rows) != 1 {
+		t.Errorf("after two Defers of the same id, row count = %d, want 1", len(rows))
 	}
 }

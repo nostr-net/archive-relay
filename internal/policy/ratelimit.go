@@ -84,8 +84,15 @@ func (l *Limiter) RejectFilter(ctx context.Context, _ nostr.Filter) (bool, strin
 
 // HTTP returns middleware that enforces the same per-IP limit on REST routes.
 func (l *Limiter) HTTP(next http.Handler) http.Handler {
+	return l.HTTPWhen(func(*http.Request) bool { return true }, next)
+}
+
+// HTTPWhen enforces the per-IP limit only on requests matching cond. Used to
+// rate-limit the NIP-86 RPC endpoint, which khatru dispatches by Content-Type
+// on any path — outside the /v1/* route-level wrapping.
+func (l *Limiter) HTTPWhen(cond func(*http.Request) bool, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !l.Allow(ClientIP(r)) {
+		if cond(r) && !l.Allow(ClientIP(r)) {
 			w.Header().Set("Retry-After", "60")
 			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 			return
@@ -100,19 +107,13 @@ func ClientIP(r *http.Request) string {
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		for _, v := range strings.Split(xff, ",") {
 			ip := strings.TrimSpace(v)
-			if parsed := net.ParseIP(ip); parsed != nil && parsed.IsGlobalUnicast() && !isPrivate(ip) {
+			// IsGlobalUnicast already excludes loopback/link-local; IsPrivate
+			// additionally skips RFC1918/fc00 addresses.
+			if p := net.ParseIP(ip); p != nil && p.IsGlobalUnicast() && !p.IsPrivate() {
 				return ip
 			}
 		}
 	}
 	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
 	return ip
-}
-
-func isPrivate(ip string) bool {
-	p := net.ParseIP(ip)
-	if p == nil {
-		return false
-	}
-	return p.IsPrivate() || p.IsLoopback() || p.IsLinkLocalUnicast()
 }

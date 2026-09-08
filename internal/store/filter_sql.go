@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -60,10 +61,12 @@ func buildFilterSQL(f nostr.Filter) (where string, args []any, tail string) {
 		default:
 			// arbitrary key: best-effort substring scan over tags_raw JSON.
 			// e.g. key="r", val="wss://x" -> position(tags_raw, '"r","wss://x"') > 0
+			// marshal via encoding/json so the escaping matches tags_raw exactly.
+			kb, _ := json.Marshal(key)
 			for _, v := range vals {
-				needle := jsonStringValue(key) + "," + jsonStringValue(v)
+				vb, _ := json.Marshal(v)
 				conds = append(conds, "position(tags_raw, ?) > 0")
-				args = append(args, needle)
+				args = append(args, string(kb)+","+string(vb))
 			}
 		}
 	}
@@ -91,10 +94,4 @@ func buildFilterSQL(f nostr.Filter) (where string, args []any, tail string) {
 	}
 	tail = fmt.Sprintf(" ORDER BY created_at DESC, id LIMIT %d", limit)
 	return where, args, tail
-}
-
-// jsonStringValue returns v quoted as a JSON string with minimal escaping.
-func jsonStringValue(v string) string {
-	r := strings.NewReplacer("\\", "\\\\", "\"", "\\\"")
-	return "\"" + r.Replace(v) + "\""
 }

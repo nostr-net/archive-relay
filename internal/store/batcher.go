@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
@@ -29,10 +30,11 @@ type batcher struct {
 	maxAge  time.Duration
 	log     *slog.Logger
 
-	// OnFlushed, if set, is invoked from the worker after a batch is durably
+	// onFlushed, if set, is invoked from the worker after a batch is durably
 	// written to ClickHouse. Used to record durable dedup state ONLY after the
 	// data is safe — so a crash never leaves "seen but not stored" holes.
-	OnFlushed func(events []*nostr.Event)
+	// atomic.Pointer so SetOnFlushed is race-free even after workers start.
+	onFlushed atomic.Pointer[func([]*nostr.Event)]
 
 	in       chan *nostr.Event
 	flushReq chan chan error // FlushAll sends a reply chan; worker drains+flushes, then replies
@@ -105,8 +107,8 @@ func (b *batcher) run() {
 			buf = append(batch, buf...)
 			return
 		}
-		if b.OnFlushed != nil {
-			b.OnFlushed(batch)
+		if fn := b.onFlushed.Load(); fn != nil {
+			(*fn)(batch)
 		}
 	}
 
