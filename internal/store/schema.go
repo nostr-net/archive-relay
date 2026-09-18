@@ -183,7 +183,7 @@ func (s *Store) initSchema(ctx context.Context) error {
 			return fmt.Errorf("index introspection failed for %q: %w", table, err)
 		}
 		if err := s.wch.QueryRow(ctx,
-			"SELECT count() FROM system.mutations WHERE database = currentDatabase() AND table = ? AND command LIKE '%materialize_index%'",
+			"SELECT count() FROM system.mutations WHERE database = currentDatabase() AND table = ? AND command ILIKE '%materialize index%'",
 			table).Scan(&matTotal); err != nil {
 			// system.mutations may be restricted on some installs; treat as
 			// "unknown" and keep the conservative once-only behavior
