@@ -86,3 +86,14 @@ Deferred; re-measure before scheduling.
    batcher (§1.2). Durable spooling not implemented.
 8. **COUNT winner semantics**: documented as approximate (NIP-45), no dedupe.
    Followers/zap-sats DO dedupe winners (id tiebreak / LIMIT 1 BY id).
+
+## Implementation status (final, 2026-09-18)
+
+All phases P0–P3 + P4-18 implemented across 8 commits (09f1ecf..ce02d7a),
+built by 10 parallel/sequential subagents (grok ×5, codex ×4, claude ×2
+attempted, re-routed) with orchestrator-owned seams, main wiring, and merge
+validation. Reviewed by the grok CLI agent in 4 rounds: r1 11 findings
+(1 BLOCKER, 4 MAJOR) → all fixed; r2 SIGNOFF with 4 residuals → fixed;
+r3 caught a case-sensitivity bug in a fix → fixed (ILIKE, verified on live
+CH); r4 **SIGNOFF**. Full unit + race + integration (live ClickHouse 26.9.1)
+suites green at HEAD.
