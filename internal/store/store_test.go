@@ -1,10 +1,15 @@
 package store
 
 import (
+	"context"
+	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 
 	"github.com/nbd-wtf/go-nostr"
+
+	"github.com/nostr-net/archive-relay/internal/config"
 )
 
 func TestClassify(t *testing.T) {
@@ -70,6 +75,12 @@ func TestBuildFilterSQL(t *testing.T) {
 	if !strings.Contains(tail, "LIMIT 50") {
 		t.Errorf("limit not applied: %s", tail)
 	}
+	if !strings.Contains(tail, "id ASC") {
+		t.Errorf("missing id ASC tiebreak in: %s", tail)
+	}
+	if !strings.Contains(tail, collapseLimitBy) {
+		t.Errorf("missing LIMIT 1 BY collapse in: %s", tail)
+	}
 	// args: 1 pubkey slice + 1 e-tag slice + 1 t-tag slice + 1 d value + 1 since = 5
 	if len(args) != 5 {
 		t.Errorf("args count = %d, want 5 (got: %v)", len(args), args)
@@ -117,6 +128,72 @@ func TestTiersForFilter(t *testing.T) {
 	tiers = tiersForFilter(nostr.Filter{Kinds: []int{5}}, map[int]string{5: TierPermanent})
 	if len(tiers) != 1 || tiers[0] != TierPermanent {
 		t.Fatalf("override not honored, got %v", tiers)
+	}
+}
+
+func TestBuildFilterSQLCollapseTail(t *testing.T) {
+	// Mixed replaceable + regular kinds still use the kind-qualified LIMIT BY
+	// expression so kind-0/3/10002 collapse on pubkey and kind-1 on id.
+	_, _, tail := buildFilterSQL(nostr.Filter{Kinds: []int{1, 3}, Limit: 25})
+	want := " ORDER BY created_at DESC, id ASC LIMIT 1 BY kind, if(kind IN (0,3,10002), pubkey, id) LIMIT 25"
+	if tail != want {
+		t.Errorf("mixed-kinds tail =\n  %q\nwant\n  %q", tail, want)
+	}
+
+	_, _, tail = buildFilterSQL(nostr.Filter{Kinds: []int{0, 3, 10002}, Limit: 10})
+	want = " ORDER BY created_at DESC, id ASC LIMIT 1 BY kind, if(kind IN (0,3,10002), pubkey, id) LIMIT 10"
+	if tail != want {
+		t.Errorf("replaceable-kinds tail =\n  %q\nwant\n  %q", tail, want)
+	}
+}
+
+func TestSortDescIDTiebreak(t *testing.T) {
+	ev := []*nostr.Event{
+		{ID: "b", CreatedAt: 100},
+		{ID: "c", CreatedAt: 200},
+		{ID: "a", CreatedAt: 100},
+		{ID: "d", CreatedAt: 50},
+		{ID: "aa", CreatedAt: 100},
+	}
+	sortDesc(ev)
+	got := make([]string, len(ev))
+	for i, e := range ev {
+		got[i] = e.ID
+	}
+	// created_at DESC, then id ASC: c (200), a, aa, b (100), d (50)
+	want := []string{"c", "a", "aa", "b", "d"}
+	if len(got) != len(want) {
+		t.Fatalf("len=%d, want %d: %v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("order = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestAcquireReadOverflow(t *testing.T) {
+	s := New(&config.Config{}, slog.Default())
+	for i := 0; i < readAdmissionCap; i++ {
+		s.readSem <- struct{}{}
+		s.readWait <- struct{}{}
+	}
+	err := s.acquireRead(context.Background())
+	if !errors.Is(err, ErrReadBusy) {
+		t.Fatalf("got %v, want ErrReadBusy", err)
+	}
+}
+
+func TestAcquireReadCtxCancel(t *testing.T) {
+	s := New(&config.Config{}, slog.Default())
+	for i := 0; i < readAdmissionCap; i++ {
+		s.readSem <- struct{}{}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := s.acquireRead(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v, want context.Canceled", err)
 	}
 }
 

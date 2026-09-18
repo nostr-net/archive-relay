@@ -19,6 +19,9 @@ import (
 // the load-shedding backpressure valve.
 var ErrBatchFull = errors.New("batch buffer full; event rejected (retry)")
 
+// ErrBatcherStopped is returned when a flush is requested after shutdown.
+var ErrBatcherStopped = errors.New("batcher stopped")
+
 // batcher decouples SaveEvent from the actual ClickHouse INSERT. It keeps
 // a bounded in-memory channel per tier; a single worker goroutine owns the
 // buffer and is the ONLY goroutine that touches it. FlushAll requests a flush
@@ -42,6 +45,9 @@ type batcher struct {
 
 	wg   sync.WaitGroup
 	stop chan struct{}
+	// gate makes enqueue and closing stop mutually exclusive. in is never closed.
+	gate     sync.RWMutex
+	stopOnce sync.Once
 }
 
 func newBatcher(conn driver.Conn, table string, maxSize int, maxAge time.Duration, log *slog.Logger) *batcher {
@@ -66,9 +72,15 @@ func (b *batcher) start() {
 	go b.run()
 }
 
-// enqueue pushes an event toward the worker; returns errBatchFull if the
-// channel is saturated (load-shed).
+// enqueue pushes an event toward the worker, or load-sheds if full or stopped.
 func (b *batcher) enqueue(evt *nostr.Event) error {
+	b.gate.RLock()
+	defer b.gate.RUnlock()
+	select {
+	case <-b.stop:
+		return ErrBatchFull
+	default:
+	}
 	select {
 	case b.in <- evt:
 		return nil
@@ -79,79 +91,188 @@ func (b *batcher) enqueue(evt *nostr.Event) error {
 
 func (b *batcher) run() {
 	defer b.wg.Done()
+	type workerState uint8
+	const (
+		normal workerState = iota
+		retry
+		stopped
+	)
+	state := normal
 	buf := make([]*nostr.Event, 0, b.maxSize)
+	var pending []*nostr.Event
+	var replies []chan error
+	// A flush request covers a finite snapshot, so concurrent producers cannot
+	// keep it open forever. Queued input stays untouched until pending is empty.
+	queued := 0
+	fails := 0
 	tick := time.NewTicker(b.maxAge)
 	defer tick.Stop()
-
-	// drain pulls everything currently in `in` into buf.
-	drain := func() {
-		for {
+	timer := time.NewTimer(time.Hour)
+	timer.Stop()
+	defer timer.Stop()
+	var retryC <-chan time.Time
+	arm := func(delay time.Duration) {
+		if !timer.Stop() {
 			select {
-			case evt := <-b.in:
-				buf = append(buf, evt)
+			case <-timer.C:
 			default:
-				return
 			}
 		}
+		timer.Reset(delay)
+		retryC = timer.C
 	}
-	// flush resets buf and sends the batch; on error, re-appends to buf.
-	flush := func() {
-		drain()
-		if len(buf) == 0 {
-			return
+	replyAll := func(err error) {
+		for _, reply := range replies {
+			reply <- err
 		}
-		batch := buf
-		buf = make([]*nostr.Event, 0, b.maxSize)
-		if err := b.flush(batch); err != nil {
-			b.log.Error("batch flush failed", "table", b.table, "n", len(batch), "err", err)
-			// preserve data for the next attempt
-			buf = append(batch, buf...)
-			return
+		replies = nil
+	}
+	// stage is only called with no pending batch. Snapshot draining bounds
+	// retained memory even when producers continuously refill the channel.
+	stage := func(n int) {
+		pending = buf
+		buf = nil
+		for i := 0; i < n; i++ {
+			pending = append(pending, <-b.in)
+		}
+		if len(pending) > 0 {
+			state = retry
+		}
+	}
+	sendOne := func(ctx context.Context) error {
+		n := min(len(pending), b.maxSize)
+		chunk := pending[:n:n]
+		if err := b.flushContext(ctx, chunk); err != nil {
+			return err
 		}
 		if fn := b.onFlushed.Load(); fn != nil {
-			(*fn)(batch)
+			(*fn)(chunk)
 		}
+		pending = pending[n:]
+		if len(pending) == 0 {
+			pending = nil
+		}
+		return nil
 	}
-
-	for {
+	attempt := func() {
+		if len(pending) > 0 {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			err := sendOne(ctx)
+			cancel()
+			if err != nil {
+				b.log.Error("batch flush failed", "table", b.table, "n", min(len(pending), b.maxSize), "err", err)
+				replyAll(err)
+				queued = 0
+				// fails counts prior consecutive failures: 1s, 2s, 4s, ... 30s.
+				arm(min(30*time.Second, time.Second<<min(fails, 5)))
+				fails++
+				return
+			}
+			fails = 0
+		}
+		if len(pending) == 0 && queued > 0 {
+			stage(queued)
+			queued = 0
+		}
+		if len(pending) > 0 {
+			// Yield to stop and flush requests between successful chunks.
+			arm(0)
+			return
+		}
+		state = normal
+		retryC = nil
+		timer.Stop()
+		replyAll(nil)
+	}
+	for state != stopped {
+		var input <-chan *nostr.Event
+		var ticks <-chan time.Time
+		if state == normal {
+			input = b.in
+			ticks = tick.C
+		}
 		select {
 		case <-b.stop:
-			flush()
-			return
-		case evt := <-b.in:
+			state = stopped
+			// One deadline bounds the entire final flush, including all chunks.
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			var err error
+			for {
+				if len(pending) == 0 {
+					stage(len(b.in))
+					state = stopped
+				}
+				if len(pending) == 0 {
+					break
+				}
+				if err = sendOne(ctx); err != nil {
+					b.log.Error("final batch flush failed; events lost", "table", b.table, "events_lost", len(pending)+len(buf)+len(b.in), "err", err)
+					break
+				}
+			}
+			cancel()
+			replyAll(err)
+		case evt := <-input:
 			buf = append(buf, evt)
 			if len(buf) >= b.maxSize {
-				flush()
+				stage(len(b.in))
+				attempt()
 			}
-		case <-tick.C:
-			flush()
+		case <-ticks:
+			stage(len(b.in))
+			attempt()
 		case reply := <-b.flushReq:
-			flush()
-			reply <- nil
+			replies = append(replies, reply)
+			queued = len(b.in)
+			if len(pending) == 0 {
+				stage(queued)
+				queued = 0
+			}
+			attempt()
+		case <-retryC:
+			attempt()
 		}
 	}
 }
 
-// FlushAll synchronously flushes this tier's buffer (draining the channel
-// first). Safe to call concurrently with enqueue. Returns the flush error, or
-// ErrBatcherStopped if the worker is gone (P0 F4: errors propagate).
+// FlushAll flushes the events buffered at the request, returning the actual
+// send error. Concurrent enqueues after that snapshot await a later flush.
 func (b *batcher) FlushAll() error {
-	reply := make(chan error, 1)
 	select {
+	case <-b.stop:
+		return ErrBatcherStopped
+	default:
+	}
+	reply := make(chan error, 1)
+	timer := time.NewTimer(30 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-b.stop:
+		return ErrBatcherStopped
 	case b.flushReq <- reply:
-		select {
-		case err := <-reply:
-			return err
-		case <-time.After(30 * time.Second):
-			return fmt.Errorf("FlushAll timed out (table %s)", b.table)
-		}
-	case <-time.After(30 * time.Second):
+	case <-timer.C:
 		return fmt.Errorf("FlushAll request timed out (table %s)", b.table)
 	}
+	select {
+	case err := <-reply:
+		return err
+	case <-b.stop:
+		return ErrBatcherStopped
+	case <-timer.C:
+		return fmt.Errorf("FlushAll timed out (table %s)", b.table)
+	}
 }
 
+// shutdown rejects new enqueues, then waits for a final bounded flush. Callers
+// should cancel producers first. An outage can lose already-ACKed client events;
+// crawler events can be re-ingested, but closing this loss window requires durable
+// spooling or post-persistence ACKs. Failed final flushes log the lost count.
 func (b *batcher) shutdown() {
-	close(b.stop)
+	b.stopOnce.Do(func() {
+		b.gate.Lock()
+		close(b.stop)
+		b.gate.Unlock()
+	})
 	b.wg.Wait()
 }
 
@@ -161,6 +282,10 @@ func (b *batcher) flush(events []*nostr.Event) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	return b.flushContext(ctx, events)
+}
+
+func (b *batcher) flushContext(ctx context.Context, events []*nostr.Event) error {
 	stmt := "INSERT INTO events_" + b.table + " (" + tierColumns + ")"
 	batch, err := b.conn.PrepareBatch(ctx, stmt)
 	if err != nil {

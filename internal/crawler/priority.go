@@ -3,6 +3,7 @@ package crawler
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/nbd-wtf/go-nostr"
@@ -13,25 +14,27 @@ import (
 
 const (
 	// fetchOverlap is the re-pull window on incremental ticks: since =
-	// last_fetched - fetchOverlap. Generous overlap covers relay propagation
-	// delay and backdated events that arrive late.
-	fetchOverlap = 24 * time.Hour
+	// last_fetched - fetchOverlap. Covers relay propagation delay and
+	// backdated events that arrive late. 2h (was 24h).
+	fetchOverlap = 2 * time.Hour
 	// fetchTimeout bounds one relay fetch; a relay that connects but never
-	// sends EOSE stalls the tick without it.
+	// sends EOSE stalls the tick without it. Applied per subscription.
 	fetchTimeout = 5 * time.Minute
-	// fullSweepAge is how stale last_fetched must get before a pubkey gets a
-	// full-history re-pull instead of an incremental one — a completeness
-	// safety net for late-arriving old events. Based on persisted state, not a
-	// tick counter, so restarts don't trigger a spurious sweep. 24h.
+	// fullSweepAge is how stale last_full_sweep must get before a pubkey
+	// gets a full-history re-pull (Since=nil). last_fetched is NOT the
+	// sweep gate — it refreshes every incremental tick, so using it made
+	// the documented periodic sweep dead (plan §1.8 / codex #13).
 	fullSweepAge = 24 * time.Hour
+	// pubkeyWorkers is the bounded parallelism for fetchPubkey per tick.
+	pubkeyWorkers = 4
 )
 
 // PriorityCrawler fetches the history of a configured set of pubkeys from a
 // dedicated relay list (separate from the firehose -sources), ensuring their
 // in-scope events are captured even when the firehose misses them. It shares
 // the store + Dedup layer with the firehose Crawler, and records last_fetched
-// in crawl_state — which bounds the next tick's `since` filter so each crawl
-// is incremental (with a periodic full-history sweep for completeness).
+// / last_full_sweep in crawl_state — last_fetched bounds the next tick's
+// `since` filter; last_full_sweep gates the periodic completeness sweep.
 // It does NOT change the stored kind scope — "preserve everything" here means
 // all in-scope kinds, completeness-assured.
 type PriorityCrawler struct {
@@ -77,32 +80,47 @@ func (p *PriorityCrawler) Run(ctx context.Context) {
 
 func (p *PriorityCrawler) tick(ctx context.Context) {
 	kinds := store.InScopeKinds()
+	sem := make(chan struct{}, pubkeyWorkers)
+	var wg sync.WaitGroup
+loop:
 	for _, pk := range p.pubkeys {
-		if ctx.Err() != nil {
-			return
+		select {
+		case <-ctx.Done():
+			break loop
+		case sem <- struct{}{}:
 		}
-		p.fetchPubkey(ctx, pk, kinds)
+		wg.Add(1)
+		go func(pk string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			p.fetchPubkey(ctx, pk, kinds)
+		}(pk)
 	}
+	wg.Wait()
 }
 
 // fetchPubkey pulls one pubkey's events from the first relay that serves it,
-// then records last_fetched. Trying relays in order lets a pubkey be completed
-// from one relay even if another is down.
+// then records last_fetched (and last_full_sweep on a full sweep). Trying
+// relays in order lets a pubkey be completed from one relay even if another
+// is down.
 func (p *PriorityCrawler) fetchPubkey(ctx context.Context, pubkey string, kinds []int) {
 	log := p.log.With("pubkey", pubkey)
 
-	// Incremental bound: since = last_fetched - fetchOverlap (so relay delay
-	// and clock skew don't drop events). A pubkey is fetched in full when it
-	// has never been crawled or last_fetched is older than fullSweepAge — the
-	// persisted completeness sweep for late-arriving old events.
-	var since *nostr.Timestamp
+	// Full sweep when the pubkey has never been crawled (last_fetched==0) or
+	// last_full_sweep is older than fullSweepAge. Incremental ticks only
+	// refresh last_fetched, so sweeps must not key off it.
 	last, err := p.ctrl.LastFetched(ctx, pubkey)
-	switch {
-	case err != nil:
+	if err != nil {
 		log.Warn("last_fetched lookup failed; doing full fetch", "err", err)
-	case last == 0 || time.Since(time.Unix(last, 0)) >= fullSweepAge:
-		// full fetch: no bound
-	default:
+	}
+	swept, serr := p.ctrl.LastSwept(ctx, pubkey)
+	if serr != nil {
+		log.Warn("last_full_sweep lookup failed; doing full fetch", "err", serr)
+	}
+	fullSweep := err != nil || serr != nil || last == 0 || time.Since(time.Unix(swept, 0)) >= fullSweepAge
+
+	var since *nostr.Timestamp
+	if !fullSweep {
 		if ts := last - int64(fetchOverlap/time.Second); ts > 0 {
 			t := nostr.Timestamp(ts)
 			since = &t
@@ -115,6 +133,9 @@ func (p *PriorityCrawler) fetchPubkey(ctx context.Context, pubkey string, kinds 
 		}
 		if p.fetchFrom(ctx, url, pubkey, kinds, since, log) {
 			_ = p.ctrl.MarkFetched(ctx, pubkey)
+			if fullSweep {
+				_ = p.ctrl.MarkSwept(ctx, pubkey)
+			}
 			return
 		}
 	}
@@ -126,13 +147,14 @@ func (p *PriorityCrawler) fetchPubkey(ctx context.Context, pubkey string, kinds 
 // The fetch is bounded by fetchTimeout; a stalled relay reports false so the
 // next relay is tried, as does a subscription closed before EOSE or a dropped
 // events channel — anything short of a clean EOSE must not advance
-// last_fetched past events that were never fetched.
+// last_fetched past events that were never fetched. One conn per relay per
+// tick (created here, closed on return).
 func (p *PriorityCrawler) fetchFrom(parent context.Context, url, pubkey string,
 	kinds []int, since *nostr.Timestamp, log *slog.Logger) bool {
 	ctx, cancel := context.WithTimeout(parent, fetchTimeout)
 	defer cancel()
 
-	relay := nostr.NewRelay(ctx, url)
+	relay := newUpstreamRelay(ctx, url)
 	if err := relay.Connect(ctx); err != nil {
 		log.Warn("connect failed", "relay", url, "err", err)
 		return false // try the next relay

@@ -29,7 +29,7 @@ const tierColumnsType = `
   INDEX idx_tag_e   tag_e   TYPE bloom_filter(0.01) GRANULARITY 4,
   INDEX idx_tag_p   tag_p   TYPE bloom_filter(0.01) GRANULARITY 4,
   INDEX idx_tag_t   tag_t   TYPE bloom_filter(0.01) GRANULARITY 4,
-  INDEX idx_content content TYPE ngrambf_v1(3, 256, 2, 0) GRANULARITY 4
+  INDEX idx_pubkey pubkey TYPE bloom_filter(0.01) GRANULARITY 4
 `
 
 // tierDDL builds a CREATE TABLE statement for one tier. ttlDelete of "" means
@@ -144,6 +144,29 @@ func (s *Store) initSchema(ctx context.Context) error {
 			}
 		}
 	}
+	for _, tier := range activeTiers {
+		table := "events_" + tier
+		for _, ddl := range []string{
+			"ALTER TABLE " + table + " ADD INDEX IF NOT EXISTS idx_pubkey pubkey TYPE bloom_filter(0.01) GRANULARITY 4",
+			"ALTER TABLE " + table + " DROP INDEX IF EXISTS idx_content",
+		} {
+			if err := s.ch.Exec(ctx, ddl); err != nil {
+				return fmt.Errorf("schema index migration failed on %q: %w", ddl, err)
+			}
+		}
+		if err := s.ch.Exec(ctx, "ALTER TABLE "+table+" MATERIALIZE INDEX idx_pubkey"); err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "already exists") {
+				s.log.Info("pubkey index materialization already exists", "table", table, "err", err)
+			} else {
+				s.log.Warn("pubkey index materialization failed; will retry at next startup", "table", table, "err", err)
+			}
+		}
+	}
+	var found uint8
+	if err := s.ch.QueryRow(ctx, "SELECT dictHas('tombstone_dict', '0000000000000000000000000000000000000000000000000000000000000000')").Scan(&found); err != nil {
+		return fmt.Errorf("tombstone dictionary startup sanity probe failed: %w", err)
+	}
+
 	return nil
 }
 

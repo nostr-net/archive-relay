@@ -1,7 +1,7 @@
 // Package store is the ClickHouse-backed eventstore.Store implementation for
 // the archive relay. It owns the tier tables, the tombstone dictionary,
-// per-tier batched inserts, and replaceable dedup via ReplacingMergeTree
-// with FINAL on read.
+// per-tier batched inserts, and replaceable dedup via LIMIT 1 BY on read
+// (ReplacingMergeTree FINAL is retained only on CountEvents — §1.10).
 package store
 
 import (
@@ -20,6 +20,18 @@ import (
 	"github.com/nostr-net/archive-relay/internal/config"
 )
 
+// readColumns is the 7-column SELECT list for QueryEvents. scanEvent must
+// match this order and count (codex #10 / §1.7).
+const readColumns = "id, pubkey, created_at, kind, content, sig, tags_raw"
+
+// readAdmissionCap is the in-flight bound for QueryEvents / CountEvents /
+// ReplaceEvent probes. It matches the intended read-pool MaxOpenConns (16).
+const readAdmissionCap = 16
+
+// ErrReadBusy is returned when the read-admission semaphore and its waiter
+// queue are both full. khatru surfaces this as a NOTICE.
+var ErrReadBusy = errors.New("read admission full")
+
 // Store implements eventstore.Store (Init/Close/QueryEvents/SaveEvent/
 // DeleteEvent/ReplaceEvent) plus Counter (CountEvents) over ClickHouse.
 type Store struct {
@@ -28,11 +40,23 @@ type Store struct {
 	log   *slog.Logger
 	tiers map[string]*batcher // keyed by tier name
 	tw    *tombstoneWriter    // owns all tombstone I/O (§1.3)
+
+	// readSem is the shared query admission semaphore (cap 16 = read pool
+	// bound). QueryEvents, CountEvents, and ReplaceEvent's slim probe all
+	// share it. ReplaceEvent is invoked from khatru's SaveEvent path, not
+	// from inside QueryEvents, so sharing cannot deadlock.
+	readSem  chan struct{}
+	readWait chan struct{} // bounded waiters (same cap); overflow → ErrReadBusy
 }
 
 // New constructs an unopened Store. Call Init() to connect + create schema.
 func New(cfg *config.Config, log *slog.Logger) *Store {
-	return &Store{cfg: cfg, log: log}
+	return &Store{
+		cfg:      cfg,
+		log:      log,
+		readSem:  make(chan struct{}, readAdmissionCap),
+		readWait: make(chan struct{}, readAdmissionCap),
+	}
 }
 
 // Init connects to ClickHouse, creates the schema, and starts the batchers.
@@ -158,91 +182,117 @@ func (s *Store) retireIDs(ctx context.Context, ids []string, reason, deletedBy s
 // latest version per (pubkey, kind) — tie-broken by lowest id (NIP-01) — should
 // be served. Because the tier ORDER BY includes created_at (for query
 // performance), ReplacingMergeTree alone does NOT collapse different versions,
-// so we retire older versions via the tombstone path and save the new one.
+// so we save the new version first, then retire superseded ids via the
+// tombstone path. A stored-but-unretired overlap is healed by QueryEvents'
+// LIMIT 1 BY collapse; a retired-but-unstored gap is not (codex #7).
 // Non-replaceable kinds fall through to a plain save.
 func (s *Store) ReplaceEvent(ctx context.Context, evt *nostr.Event) error {
 	if !isReplaceableKind(evt.Kind) {
 		return s.SaveEvent(ctx, evt)
 	}
-	// fetch current versions for this (pubkey, kind) — already tombstone-filtered
-	ch, err := s.QueryEvents(ctx, nostr.Filter{
-		Authors: []string{evt.PubKey}, Kinds: []int{evt.Kind}, Limit: 100,
-	})
+
+	if err := s.acquireRead(ctx); err != nil {
+		return fmt.Errorf("replace probe: %w", err)
+	}
+	prev, err := s.probeReplaceable(ctx, evt)
+	s.releaseRead()
 	if err != nil {
 		return fmt.Errorf("replace query: %w", err)
 	}
+
 	shouldStore := true
 	var retire []string
-	for prev := range ch {
+	for _, p := range prev {
+		prevTS := nostr.Timestamp(p.createdAt)
 		// prev is "older" (should be retired) if it has an earlier timestamp,
 		// or the same timestamp but a higher id (NIP-01 keeps the lowest id).
-		prevOlder := prev.CreatedAt < evt.CreatedAt ||
-			(prev.CreatedAt == evt.CreatedAt && prev.ID > evt.ID)
+		prevOlder := prevTS < evt.CreatedAt ||
+			(prevTS == evt.CreatedAt && p.id > evt.ID)
 		if prevOlder {
-			retire = append(retire, prev.ID)
+			retire = append(retire, p.id)
 		} else {
 			shouldStore = false // an equal-or-newer version exists; discard incoming
 		}
 	}
-	// retire all superseded versions in one batch with a single dictionary reload
+
+	// Save first, then retire. If the save fails we must not hide the old
+	// versions — that would leave the author with nothing served.
+	if shouldStore {
+		if err := s.SaveEvent(ctx, evt); err != nil {
+			return err
+		}
+	}
 	if len(retire) > 0 {
 		if err := s.retireIDs(ctx, retire, "replaced", evt.PubKey); err != nil {
 			s.log.Warn("retire superseded versions failed", "n", len(retire), "err", err)
 		}
 	}
-	if shouldStore {
-		return s.SaveEvent(ctx, evt)
-	}
 	return nil
 }
 
-// QueryEvents streams events matching the filter, querying each relevant tier
-// with FINAL (so replaceable/addressable dedup is correct) and merging in Go.
-// The tombstone predicate is added by buildFilterSQL.
-func (s *Store) QueryEvents(ctx context.Context, f nostr.Filter) (chan *nostr.Event, error) {
-	where, args, tail := buildFilterSQL(f)
-	tiers := tiersForFilter(f, s.cfg.Classifier)
+type replaceableRow struct {
+	id        string
+	createdAt uint32
+}
 
-	// Merge across tiers in Go: collect, sort by created_at desc, respect Limit.
-	limit := f.Limit
-	if limit < 1 || limit > defaultQueryLimit {
-		limit = defaultQueryLimit
+// probeReplaceable runs the two-column slim probe (§1.6) against every tier
+// that can hold evt's kind. No FINAL — LIMIT 50 of live (non-tombstoned) rows.
+func (s *Store) probeReplaceable(ctx context.Context, evt *nostr.Event) ([]replaceableRow, error) {
+	f := nostr.Filter{Authors: []string{evt.PubKey}, Kinds: []int{evt.Kind}}
+	tiers := tiersForFilter(f, s.cfg.Classifier)
+	var out []replaceableRow
+	for _, t := range tiers {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		q := fmt.Sprintf("SELECT id, created_at FROM events_%s WHERE pubkey=? AND kind=? AND NOT dictHas('tombstone_dict', id) ORDER BY created_at DESC, id ASC LIMIT 50", t)
+		rows, err := s.ch.Query(ctx, q, evt.PubKey, uint32(evt.Kind))
+		if err != nil {
+			return nil, fmt.Errorf("events_%s: %w", t, err)
+		}
+		for rows.Next() {
+			var row replaceableRow
+			if err := rows.Scan(&row.id, &row.createdAt); err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("scan events_%s: %w", t, err)
+			}
+			out = append(out, row)
+		}
+		qErr := rows.Err()
+		_ = rows.Close()
+		if qErr != nil {
+			return nil, fmt.Errorf("rows events_%s: %w", t, qErr)
+		}
+	}
+	return out, nil
+}
+
+// QueryEvents streams events matching the filter. Per-tier SQL uses
+// LIMIT 1 BY to collapse replaceable versions and exact-id duplicates — no
+// FINAL (this is the FINAL removal, P4-17 prerequisite).
+//
+// Semantic: "latest matching version". Collapse runs AFTER WHERE, so a
+// tag/`until`-filtered query can legitimately return an older version when
+// the newest does not match. This is consistent with most relays; winner-
+// then-filter would require a subquery.
+//
+// Tier queries run eagerly and any SQL/scan error is returned synchronously
+// (khatru then sends NOTICE) before the result channel is created. The
+// collected rows are then streamed through a buffered channel.
+func (s *Store) QueryEvents(ctx context.Context, f nostr.Filter) (chan *nostr.Event, error) {
+	if err := s.acquireRead(ctx); err != nil {
+		return nil, err
+	}
+	defer s.releaseRead()
+
+	collected, err := s.collectEvents(ctx, f)
+	if err != nil {
+		return nil, err
 	}
 
 	out := make(chan *nostr.Event, 64)
 	go func() {
 		defer close(out)
-		var collected []*nostr.Event
-		for _, t := range tiers {
-			if ctx.Err() != nil {
-				return
-			}
-			q := fmt.Sprintf("SELECT %s FROM events_%s FINAL WHERE %s%s",
-				tierColumns, t, where, tail)
-			rows, err := s.ch.Query(ctx, q, args...)
-			if err != nil {
-				s.log.Error("query failed", "tier", t, "err", err)
-				continue
-			}
-			n := 0
-			for rows.Next() {
-				e, err := scanEvent(rows)
-				if err != nil {
-					s.log.Error("scan event failed", "tier", t, "err", err)
-					_ = rows.Close()
-					return
-				}
-				collected = append(collected, e)
-				n++
-			}
-			_ = rows.Close()
-			s.log.Info("tier scan", "tier", t, "rows", n)
-		}
-		// stable-ish ordering across tiers + global limit
-		sortDesc(collected)
-		if len(collected) > limit {
-			collected = collected[:limit]
-		}
 		for _, e := range collected {
 			select {
 			case out <- e:
@@ -254,13 +304,68 @@ func (s *Store) QueryEvents(ctx context.Context, f nostr.Filter) (chan *nostr.Ev
 	return out, nil
 }
 
-// CountEvents returns the count of matching live (non-tombstoned) events,
-// deduped via FINAL per tier.
+func (s *Store) collectEvents(ctx context.Context, f nostr.Filter) ([]*nostr.Event, error) {
+	where, args, tail := buildFilterSQL(f)
+	tiers := tiersForFilter(f, s.cfg.Classifier)
+
+	limit := f.Limit
+	if limit < 1 || limit > defaultQueryLimit {
+		limit = defaultQueryLimit
+	}
+
+	var collected []*nostr.Event
+	for _, t := range tiers {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		q := fmt.Sprintf("SELECT %s FROM events_%s WHERE %s%s",
+			readColumns, t, where, tail)
+		rows, err := s.ch.Query(ctx, q, args...)
+		if err != nil {
+			return nil, fmt.Errorf("query events_%s: %w", t, err)
+		}
+		n := 0
+		for rows.Next() {
+			e, err := scanEvent(rows)
+			if err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("scan events_%s: %w", t, err)
+			}
+			collected = append(collected, e)
+			n++
+		}
+		qErr := rows.Err()
+		_ = rows.Close()
+		if qErr != nil {
+			return nil, fmt.Errorf("rows events_%s: %w", t, qErr)
+		}
+		s.log.Debug("tier scan", "tier", t, "rows", n)
+	}
+	// Deterministic merge across tiers + global limit (codex #4).
+	sortDesc(collected)
+	if len(collected) > limit {
+		collected = collected[:limit]
+	}
+	return collected, nil
+}
+
+// CountEvents returns the count of matching live (non-tombstoned) events.
+// Unlike QueryEvents, COUNT still uses FINAL and counts every stored version
+// (no LIMIT 1 BY winner collapse) — a documented divergence (NIP-45 counts
+// are approximate; see perf-plan §1.10).
 func (s *Store) CountEvents(ctx context.Context, f nostr.Filter) (int64, error) {
+	if err := s.acquireRead(ctx); err != nil {
+		return 0, err
+	}
+	defer s.releaseRead()
+
 	where, args, _ := buildFilterSQL(f)
 	tiers := tiersForFilter(f, s.cfg.Classifier)
 	var total int64
 	for _, t := range tiers {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
 		q := fmt.Sprintf("SELECT count() FROM events_%s FINAL WHERE %s", t, where)
 		var n uint64
 		if err := s.ch.QueryRow(ctx, q, args...).Scan(&n); err != nil {
@@ -269,6 +374,41 @@ func (s *Store) CountEvents(ctx context.Context, f nostr.Filter) (int64, error) 
 		total += int64(n)
 	}
 	return total, nil
+}
+
+// acquireRead takes one admission token. If all tokens are held, the caller
+// joins a bounded waiter queue (cap 16) that is also ctx-cancellable.
+// Overflow of the waiter queue returns ErrReadBusy immediately so khatru
+// can NOTICE rather than accumulating unbounded blocked REQs (codex #11).
+func (s *Store) acquireRead(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	select {
+	case s.readSem <- struct{}{}:
+		return nil
+	default:
+	}
+	select {
+	case s.readWait <- struct{}{}:
+		defer func() { <-s.readWait }()
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return ErrReadBusy
+	}
+	select {
+	case s.readSem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Store) releaseRead() {
+	<-s.readSem
 }
 
 // tiersForFilter returns the tiers that could contain the filter's kinds.
@@ -295,25 +435,27 @@ func tiersForFilter(f nostr.Filter, override map[int]string) []string {
 }
 
 func sortDesc(ev []*nostr.Event) {
-	// stable: equal-timestamp events keep their tier-query order, which already
-	// sorted by id, so the cross-tier merge is deterministic.
-	sort.SliceStable(ev, func(i, j int) bool {
-		return ev[i].CreatedAt > ev[j].CreatedAt
+	// (created_at DESC, id ASC) matches the per-tier ORDER BY so a cross-tier
+	// global LIMIT is deterministic (codex #4).
+	sort.Slice(ev, func(i, j int) bool {
+		if ev[i].CreatedAt != ev[j].CreatedAt {
+			return ev[i].CreatedAt > ev[j].CreatedAt
+		}
+		return ev[i].ID < ev[j].ID
 	})
 }
 
-// scanEvent reads a tier-table row (in tierColumns order) into a nostr.Event.
+// scanEvent reads a QueryEvents row (readColumns order: 7 destinations).
 func scanEvent(rows driver.Rows) (*nostr.Event, error) {
 	var (
-		id, pubkey, content, sig, tagsRaw, tagD, replyTo string
-		tagE, tagP, tagT                                 []string
-		createdAt, kind                                  uint32
+		id, pubkey, content, sig, tagsRaw string
+		createdAt, kind                   uint32
 	)
-	if err := rows.Scan(&id, &pubkey, &createdAt, &kind, &content, &sig, &tagsRaw, &tagE, &tagP, &tagT, &tagD, &replyTo); err != nil {
+	if err := rows.Scan(&id, &pubkey, &createdAt, &kind, &content, &sig, &tagsRaw); err != nil {
 		return nil, err
 	}
 	tags := nostr.Tags{}
-	_ = json.Unmarshal([]byte(tagsRaw), &tags) // tags_raw is authoritative; arrays are accelerators
+	_ = json.Unmarshal([]byte(tagsRaw), &tags) // tags_raw is authoritative
 	return &nostr.Event{
 		ID:        id,
 		PubKey:    pubkey,

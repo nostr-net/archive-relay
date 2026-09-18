@@ -15,6 +15,11 @@ import (
 	"github.com/nostr-net/archive-relay/internal/store"
 )
 
+// reconnectOverlap is the since-window applied on reconnect AFTER a source has
+// completed its first EOSE. Mid-backfill disconnects restart with Since=nil so
+// unfinished history is not abandoned (plan §1.8 / §3).
+const reconnectOverlap = 2 * time.Hour
+
 // Crawler fans out one ingestion goroutine per source relay URL.
 type Crawler struct {
 	sources []string
@@ -25,7 +30,9 @@ type Crawler struct {
 
 // New constructs a firehose Crawler for the given source relay URLs. dedup is
 // shared with any per-pubkey PriorityCrawler; wire dedup.OnFlushed to
-// store.SetOnFlushed once at startup.
+// store.SetOnFlushed once at startup. Pruning and the durable seen_events
+// writer live on Dedup (StartWriter / StartPrune) so they run even with zero
+// sources — call those from main, not from Run.
 func New(sources []string, s *store.Store, dedup *Dedup, log *slog.Logger) *Crawler {
 	return &Crawler{sources: sources, store: s, dedup: dedup, log: log}
 }
@@ -36,10 +43,6 @@ func (c *Crawler) Run(ctx context.Context) {
 		c.log.Warn("crawler has no source relays configured")
 		return
 	}
-	// Prune the dedup table hourly so it doesn't grow unbounded. seen_events is
-	// only useful for restart-warm and the backfill window; older rows are dead
-	// weight.
-	go c.pruneLoop(ctx, time.Hour, 7*24*time.Hour)
 
 	kinds := store.InScopeKinds()
 	var wg sync.WaitGroup
@@ -53,33 +56,46 @@ func (c *Crawler) Run(ctx context.Context) {
 	wg.Wait()
 }
 
-func (c *Crawler) pruneLoop(ctx context.Context, every, maxAge time.Duration) {
-	t := time.NewTicker(every)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			if n, err := c.dedup.ctrl.PruneSeen(ctx, maxAge); err != nil {
-				c.log.Warn("prune seen_events failed", "err", err)
-			} else if n > 0 {
-				c.log.Info("pruned seen_events", "rows", n)
-			}
-		}
+// newUpstreamRelay builds a go-nostr Relay with AssumeValid set BEFORE Connect.
+// v0.52.3 has no ctor arg for this; it is a field assignment. AssumeValid skips
+// the library subscription-loop signature check, so ingest still CheckSignatures
+// every unseen event (and CheckID).
+func newUpstreamRelay(ctx context.Context, url string) *nostr.Relay {
+	r := nostr.NewRelay(ctx, url)
+	r.AssumeValid = true
+	return r
+}
+
+// sinceForReconnect returns a since timestamp only after the source has
+// completed its first EOSE. A nil result means "full backfill" (Since unset).
+func sinceForReconnect(backfillComplete bool, lastDisconnect time.Time) *nostr.Timestamp {
+	if !backfillComplete || lastDisconnect.IsZero() {
+		return nil
 	}
+	sec := lastDisconnect.Add(-reconnectOverlap).Unix()
+	if sec <= 0 {
+		return nil
+	}
+	ts := nostr.Timestamp(sec)
+	return &ts
 }
 
 // runSource connects (with reconnect+backoff) and subscribes to the in-scope
-// kinds, persisting every received event.
+// kinds, persisting every received event. Reconnect `since` is backfill-aware:
+// unfinished history is never abandoned.
 func (c *Crawler) runSource(ctx context.Context, url string, kinds []int) {
 	log := c.log.With("source", url)
-	filter := nostr.Filter{Kinds: kinds}
-	// no Limit: take the relay's historical backlog, then stay open for live.
 	backoff := time.Second
+	backfillComplete := false
+	var lastDisconnect time.Time
 
 	for ctx.Err() == nil {
-		relay := nostr.NewRelay(ctx, url)
+		filter := nostr.Filter{Kinds: kinds}
+		if since := sinceForReconnect(backfillComplete, lastDisconnect); since != nil {
+			filter.Since = since
+		}
+
+		relay := newUpstreamRelay(ctx, url)
 		if err := relay.Connect(ctx); err != nil {
 			log.Warn("connect failed; retrying", "err", err, "backoff", backoff)
 			sleepCtx(ctx, backoff)
@@ -87,11 +103,12 @@ func (c *Crawler) runSource(ctx context.Context, url string, kinds []int) {
 			continue
 		}
 		backoff = time.Second
-		log.Info("connected; subscribing", "kinds", kinds)
+		log.Info("connected; subscribing", "kinds", kinds, "backfillComplete", backfillComplete)
 
 		sub, err := relay.Subscribe(ctx, nostr.Filters{filter})
 		if err != nil {
 			log.Warn("subscribe failed; reconnecting", "err", err)
+			_ = relay.Close()
 			sleepCtx(ctx, 2*time.Second)
 			continue
 		}
@@ -100,17 +117,24 @@ func (c *Crawler) runSource(ctx context.Context, url string, kinds []int) {
 		for {
 			select {
 			case <-ctx.Done():
+				lastDisconnect = time.Now()
+				_ = relay.Close()
 				return
 			case <-sub.EndOfStoredEvents:
+				backfillComplete = true
 				log.Info("EOSE; continuing for live events", "ingested", ingested, "skipped", skipped)
 			case reason := <-sub.ClosedReason:
 				log.Warn("subscription closed; reconnecting", "reason", reason)
+				lastDisconnect = time.Now()
+				_ = relay.Close()
 				sleepCtx(ctx, 2*time.Second)
-				goto reconnect
+				goto next
 			case ev, ok := <-sub.Events:
 				if !ok {
 					log.Info("events channel closed; reconnecting", "ingested", ingested)
-					goto reconnect
+					lastDisconnect = time.Now()
+					_ = relay.Close()
+					goto next
 				}
 				if c.handle(ctx, ev) {
 					ingested++
@@ -119,8 +143,7 @@ func (c *Crawler) runSource(ctx context.Context, url string, kinds []int) {
 				}
 			}
 		}
-	reconnect:
-		_ = relay.Close()
+	next:
 	}
 }
 

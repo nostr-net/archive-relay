@@ -17,9 +17,10 @@ import (
 
 const schema = `
 CREATE TABLE IF NOT EXISTS crawl_state (
-  pubkey        TEXT PRIMARY KEY,
-  last_fetched  INTEGER NOT NULL DEFAULT 0,
-  updated_at    INTEGER NOT NULL DEFAULT 0
+  pubkey          TEXT PRIMARY KEY,
+  last_fetched    INTEGER NOT NULL DEFAULT 0,
+  last_full_sweep INTEGER NOT NULL DEFAULT 0,
+  updated_at      INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS scheduled_events (
@@ -50,18 +51,64 @@ type DB struct {
 }
 
 // Open opens (creating if absent) the control DB and ensures the schema.
+//
+// auto_vacuum=INCREMENTAL is set via DSN so it applies before CREATE TABLE on a
+// fresh file (SQLite ignores a mid-life auto_vacuum change unless VACUUM is
+// run). Existing databases keep their original auto_vacuum mode until an
+// operator VACUUMs them; we still emit the pragma so new files get it.
 func Open(path string, log *slog.Logger) (*DB, error) {
-	conn, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+	conn, err := sql.Open("sqlite", path+"?_pragma=auto_vacuum(INCREMENTAL)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, err
 	}
 	// SQLite is single-writer; a small pool is plenty and lets query vs write overlap.
 	conn.SetMaxOpenConns(4)
 	if _, err := conn.Exec(schema); err != nil {
+		_ = conn.Close()
 		return nil, fmt.Errorf("control schema init: %w", err)
 	}
+	db := &DB{conn: conn, log: log}
+	if err := db.migrateCrawlState(context.Background()); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
 	log.Info("control db ready", "path", path)
-	return &DB{conn: conn, log: log}, nil
+	return db, nil
+}
+
+// migrateCrawlState adds last_full_sweep if an older crawl_state table lacks
+// it. Idempotent: Open twice (or a DB created with the current schema) is a
+// no-op after the column exists.
+func (d *DB) migrateCrawlState(ctx context.Context) error {
+	rows, err := d.conn.QueryContext(ctx, "PRAGMA table_info(crawl_state)")
+	if err != nil {
+		return fmt.Errorf("crawl_state table_info: %w", err)
+	}
+	defer rows.Close()
+	has := false
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, colType string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &colType, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == "last_full_sweep" {
+			has = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if has {
+		return nil
+	}
+	_, err = d.conn.ExecContext(ctx,
+		"ALTER TABLE crawl_state ADD COLUMN last_full_sweep INTEGER NOT NULL DEFAULT 0")
+	if err != nil {
+		return fmt.Errorf("add last_full_sweep: %w", err)
+	}
+	return nil
 }
 
 func (d *DB) Close() error { return d.conn.Close() }
@@ -145,6 +192,36 @@ func (d *DB) PruneSeen(ctx context.Context, maxAge time.Duration) (int64, error)
 	return n, nil
 }
 
+// PruneSeenByRowid deletes the oldest seen_events rows so at most cap newest
+// rows remain. Uses `rowid <= (SELECT … ORDER BY rowid DESC LIMIT 1 OFFSET cap)`
+// (`<=`, not `<`) so the cutoff row is included and remaining == cap, not
+// cap+1 (plan §1.9 / codex #15). The delete runs in its own transaction.
+// cap <= 0 is a no-op.
+func (d *DB) PruneSeenByRowid(ctx context.Context, cap int) (int64, error) {
+	if cap <= 0 {
+		return 0, nil
+	}
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `
+DELETE FROM seen_events
+WHERE rowid <= (SELECT rowid FROM seen_events ORDER BY rowid DESC LIMIT 1 OFFSET ?)`, cap)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	// Reclaim free pages when auto_vacuum=INCREMENTAL is in effect (no-op on
+	// pre-existing files that never VACUUMed into incremental mode).
+	_, _ = d.conn.ExecContext(ctx, "PRAGMA incremental_vacuum")
+	return n, nil
+}
+
 // AllowedPubkey is one row of the dynamic allow-list.
 type AllowedPubkey struct {
 	Pubkey    string
@@ -222,6 +299,29 @@ func (d *DB) MarkFetched(ctx context.Context, pubkey string) error {
 	_, err := d.conn.ExecContext(ctx, `
 INSERT INTO crawl_state(pubkey, last_fetched, updated_at) VALUES(?, ?, ?)
 ON CONFLICT(pubkey) DO UPDATE SET last_fetched = excluded.last_fetched, updated_at = excluded.updated_at`,
+		pubkey, now, now)
+	return err
+}
+
+// LastSwept returns the last successful full-history sweep time for a pubkey
+// (0 if the pubkey was never fully swept).
+func (d *DB) LastSwept(ctx context.Context, pubkey string) (int64, error) {
+	var ts int64
+	err := d.conn.QueryRowContext(ctx,
+		"SELECT last_full_sweep FROM crawl_state WHERE pubkey = ?", pubkey).Scan(&ts)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	return ts, err
+}
+
+// MarkSwept records that a priority-crawl pubkey just completed a full-history
+// sweep. Does not clobber last_fetched.
+func (d *DB) MarkSwept(ctx context.Context, pubkey string) error {
+	now := time.Now().Unix()
+	_, err := d.conn.ExecContext(ctx, `
+INSERT INTO crawl_state(pubkey, last_full_sweep, updated_at) VALUES(?, ?, ?)
+ON CONFLICT(pubkey) DO UPDATE SET last_full_sweep = excluded.last_full_sweep, updated_at = excluded.updated_at`,
 		pubkey, now, now)
 	return err
 }

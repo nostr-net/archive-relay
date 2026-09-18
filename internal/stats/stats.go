@@ -1,6 +1,6 @@
 // Package stats maintains the snapshot/aggregate tables and exposes query
-// helpers for the stats API. Refresh jobs recompute from FINAL reads with
-// count(DISTINCT id), so duplicate ingests never inflate them.
+// helpers for the stats API. Counts deduplicate event IDs; follower snapshots
+// select the latest contact list, and zap amounts are deduplicated before summing.
 package stats
 
 import (
@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
@@ -16,8 +17,11 @@ import (
 
 // Service runs the periodic refresh jobs and answers stats queries.
 type Service struct {
-	ch  driver.Conn
-	log *slog.Logger
+	ch            driver.Conn
+	log           *slog.Logger
+	followersMu   sync.Mutex
+	engineChecked bool
+	engineErr     error
 }
 
 // New constructs a stats Service over the given ClickHouse connection.
@@ -66,23 +70,49 @@ func (s *Service) refreshAll(ctx context.Context) {
 }
 
 // RefreshFollowers recomputes per-author follower counts from the latest kind-3
-// contact list of each author: TRUNCATE then repopulate (cheap relative to the
-// scan), so the table engine can be a plain MergeTree.
+// contact list of each author, building in staging before an atomic swap.
 func (s *Service) RefreshFollowers(ctx context.Context) error {
-	if err := s.ch.Exec(ctx, "TRUNCATE TABLE author_follower_counts"); err != nil {
+	s.followersMu.Lock()
+	defer s.followersMu.Unlock()
+	if !s.engineChecked {
+		var engine string
+		if err := s.ch.QueryRow(ctx, "SELECT engine FROM system.databases WHERE name = currentDatabase()").Scan(&engine); err != nil {
+			return fmt.Errorf("check database engine: %w", err)
+		}
+		s.engineChecked = true
+		if engine != "Atomic" {
+			s.engineErr = fmt.Errorf("follower refresh requires Atomic database engine for EXCHANGE TABLES, got %q", engine)
+		}
+	}
+	if s.engineErr != nil {
+		return s.engineErr
+	}
+	if err := s.ch.Exec(ctx, "TRUNCATE TABLE author_follower_counts_staging"); err != nil {
 		return fmt.Errorf("truncate: %w", err)
 	}
 	q := `
-INSERT INTO author_follower_counts (pubkey, followers)
+INSERT INTO author_follower_counts_staging (pubkey, followers)
 SELECT p_tag AS pubkey, count(DISTINCT author) AS followers
 FROM (
   SELECT pubkey AS author, arrayJoin(tag_p) AS p_tag
-  FROM (SELECT * FROM events_permanent FINAL WHERE kind = 3 ORDER BY created_at DESC LIMIT 1 BY pubkey)
+  FROM (SELECT * FROM events_permanent FINAL WHERE kind = 3
+    AND NOT dictHas('tombstone_dict', id)
+    ORDER BY created_at DESC, id ASC LIMIT 1 BY pubkey)
 )
 GROUP BY p_tag`
-	return s.ch.Exec(ctx, q)
+	if err := s.ch.Exec(ctx, q); err != nil {
+		return fmt.Errorf("build follower staging: %w", err)
+	}
+	if err := s.ch.Exec(ctx, "EXCHANGE TABLES author_follower_counts AND author_follower_counts_staging"); err != nil {
+		return fmt.Errorf("exchange follower snapshot: %w", err)
+	}
+	return nil
 }
 
+// Tombstone filtering only repairs future buckets and the rolling refresh
+// window. Frozen historical buckets retain tombstoned contributions: a known
+// divergence requiring a backfill to repair.
+//
 // RefreshNoteMonthly recomputes per-note-per-month engagement for the current
 // and previous month (stragglers); older months are frozen.
 func (s *Service) RefreshNoteMonthly(ctx context.Context) error {
@@ -94,17 +124,30 @@ func (s *Service) RefreshNoteMonthly(ctx context.Context) error {
 INSERT INTO stats_note_monthly (note_id, month, metric, count, sats)
 SELECT note_id, month, metric,
        count(DISTINCT id) AS count,
-       sum(if(metric = 'zap', toUInt64OrZero(extract(tags_raw, '"amount","([0-9]+)"')), 0)) AS sats
+       sum(amount) AS sats
 FROM (
   SELECT
     multiIf(kind = 1, reply_to, tag_e[1]) AS note_id,
     toStartOfMonth(toDateTime(created_at)) AS month,
     multiIf(kind = 7, 'reaction', kind IN (6, 16), 'repost', kind = 1, 'reply', kind = 9735, 'zap', '') AS metric,
-    id, tags_raw
+    id, toUInt64(0) AS amount
   FROM events_all
-  WHERE kind IN (1, 6, 7, 16, 9735)
+  WHERE kind IN (1, 6, 7, 16)
+    AND NOT dictHas('tombstone_dict', id)
     AND ((kind = 1 AND reply_to != '') OR (kind IN (6, 7, 16, 9735) AND length(tag_e) >= 1))
     AND created_at >= toUnixTimestamp(toStartOfMonth(addMonths(today(), -1)))
+  UNION ALL
+  SELECT note_id, month, metric, id, amount FROM (
+    SELECT tag_e[1] AS note_id,
+           toStartOfMonth(toDateTime(created_at)) AS month,
+           'zap' AS metric, id,
+           toUInt64OrZero(extract(tags_raw, '"amount","([0-9]+)"')) AS amount
+    FROM events_all
+    WHERE kind = 9735 AND length(tag_e) >= 1
+      AND NOT dictHas('tombstone_dict', id)
+      AND created_at >= toUnixTimestamp(toStartOfMonth(addMonths(today(), -1)))
+    LIMIT 1 BY id
+  )
 )
 WHERE metric != '' AND note_id != ''
 GROUP BY note_id, month, metric`
@@ -112,6 +155,9 @@ GROUP BY note_id, month, metric`
 }
 
 // RefreshDaily recomputes the daily network rollups for the last 3 days.
+// COUNT, stats_daily, and DAU retain every stored replaceable version rather
+// than selecting logical winners (a documented divergence; NIP-45 counts are
+// approximate). DISTINCT IDs / authors still deduplicate individual values.
 func (s *Service) RefreshDaily(ctx context.Context) error {
 	if err := s.ch.Exec(ctx, "DELETE FROM stats_daily WHERE day >= today() - 3"); err != nil {
 		return fmt.Errorf("delete: %w", err)
@@ -125,6 +171,7 @@ FROM (
          id
   FROM events_all
   WHERE kind IN (1, 6, 7, 16, 9735) AND created_at >= toUnixTimestamp(today() - 3)
+    AND NOT dictHas('tombstone_dict', id)
 )
 WHERE metric != ''
 GROUP BY day, metric`
@@ -141,6 +188,7 @@ INSERT INTO stats_daily_active (day, authors)
 SELECT toDate(toDateTime(created_at)) AS day, uniqState(pubkey) AS authors
 FROM events_all
 WHERE created_at >= toUnixTimestamp(today() - 3)
+  AND NOT dictHas('tombstone_dict', id)
 GROUP BY day`
 	return s.ch.Exec(ctx, q)
 }

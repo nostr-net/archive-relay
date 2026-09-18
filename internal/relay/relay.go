@@ -14,12 +14,13 @@ import (
 
 // Deps bundles everything the relay needs to wire its hooks.
 type Deps struct {
-	Store      *store.Store
-	Sched      *scheduler.Scheduler       // nil to disable future-dating
-	Limiter    *policy.Limiter            // nil to disable per-IP rate limiting
-	Breadth    policy.RejectFilterBreadth // zero-value fields disable that limit
-	Access     *policy.Access             // nil to disable NIP-42 + allow-list
-	ServiceURL string                     // canonical URL; required when Access is enabled
+	Store             *store.Store
+	Sched             *scheduler.Scheduler       // nil to disable future-dating
+	Limiter           *policy.Limiter            // nil to disable per-IP rate limiting
+	Breadth           policy.RejectFilterBreadth // zero-value fields disable that limit
+	Access            *policy.Access             // nil to disable NIP-42 + allow-list
+	ServiceURL        string                     // canonical URL; required when Access is enabled
+	DefaultSinceHours int                        // 0 disables; injects since on pure global-feed REQs
 }
 
 // New assembles a khatru Relay with all hooks wired to the deps.
@@ -72,6 +73,28 @@ func New(d Deps) *khatru.Relay {
 	// --- reads ---
 	rl.QueryEvents = append(rl.QueryEvents, d.Store.QueryEvents)
 	rl.CountEvents = append(rl.CountEvents, d.Store.CountEvents)
+
+	// Default-since runs at OverwriteFilter (before RejectFilter), NOT in
+	// buildFilterSQL — because the store's filter SQL also feeds COUNT and REST,
+	// which must not silently gain a time bound.
+	if d.DefaultSinceHours > 0 {
+		hours := d.DefaultSinceHours
+		rl.OverwriteFilter = append(rl.OverwriteFilter, func(_ context.Context, filter *nostr.Filter) {
+			// Pure global-feed shape only. Kinds may be anything ({kinds:[1]}
+			// with nothing else IS a global feed). {until:…} pagination and
+			// tag-only queries stay untouched (codex #8).
+			if len(filter.IDs) != 0 || len(filter.Authors) != 0 || len(filter.Tags) != 0 || filter.Until != nil {
+				return
+			}
+			// Only set Since when it is currently nil (never narrow an existing
+			// bound — can't happen given the guard, but keep the nil check as defense).
+			if filter.Since != nil {
+				return
+			}
+			since := nostr.Now() - nostr.Timestamp(hours)*3600
+			filter.Since = &since
+		})
+	}
 
 	// --- egress gates ---
 	// auth first (auth-required challenge), then per-IP read rate limit, then

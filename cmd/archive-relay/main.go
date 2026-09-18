@@ -125,10 +125,11 @@ func main() {
 	rl = relay.New(relay.Deps{
 		Store: s, Sched: sched, Limiter: limiter, Breadth: breadth,
 		Access: access, ServiceURL: cfg.Relay.ServiceURL,
+		DefaultSinceHours: cfg.Policy.DefaultSinceHours, // pure global-feed REQ bound (F8)
 	})
 	go sched.Run(ctx)
 
-	api.NewHandler(svc, s, limiter, access, log.With("pkg", "api")).Register(rl.Router())
+	api.NewHandler(svc, s, limiter, access, breadth, log.With("pkg", "api")).Register(rl.Router())
 
 	// Ops profiling (stdlib pprof) on loopback only — never on the public port.
 	// net/http/pprof registers its handlers on http.DefaultServeMux at import.

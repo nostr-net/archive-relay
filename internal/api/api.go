@@ -8,9 +8,11 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"time"
 
+	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"github.com/nbd-wtf/go-nostr"
 
 	"github.com/nostr-net/archive-relay/internal/policy"
@@ -18,10 +20,16 @@ import (
 	"github.com/nostr-net/archive-relay/internal/store"
 )
 
+type eventStore interface {
+	CH() driver.Conn
+	QueryEvents(context.Context, nostr.Filter) (chan *nostr.Event, error)
+}
+
 // Handler holds dependencies for the HTTP handlers.
 type Handler struct {
 	stats   *stats.Service
-	store   *store.Store
+	store   eventStore
+	breadth policy.RejectFilterBreadth
 	limiter *policy.Limiter // optional per-IP REST rate limit
 	access  *policy.Access  // optional: when enabled, /v1/* requires NIP-98 + allow-list
 	log     *slog.Logger
@@ -29,8 +37,8 @@ type Handler struct {
 
 // NewHandler constructs the API handler. limiter and access may be nil.
 func NewHandler(s *stats.Service, st *store.Store, limiter *policy.Limiter,
-	access *policy.Access, log *slog.Logger) *Handler {
-	return &Handler{stats: s, store: st, limiter: limiter, access: access, log: log}
+	access *policy.Access, breadth policy.RejectFilterBreadth, log *slog.Logger) *Handler {
+	return &Handler{stats: s, store: st, limiter: limiter, access: access, breadth: breadth, log: log}
 }
 
 // Register mounts the API routes on the given mux.
@@ -61,13 +69,18 @@ func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
 	chOK := h.store.CH().Ping(ctx) == nil
 	var events uint64
 	if chOK {
-		_ = h.store.CH().QueryRow(ctx, "SELECT count() FROM events_all").Scan(&events)
+		_ = h.store.CH().QueryRow(ctx, `SELECT sum(rows) FROM system.parts
+WHERE active AND database = currentDatabase()
+  AND table IN ('events_permanent','events_archive','events_social')`).Scan(&events)
 	}
 	code := http.StatusOK
 	if !chOK {
 		code = http.StatusServiceUnavailable
 	}
-	writeJSON(w, code, map[string]any{"ok": chOK, "clickhouse": chOK, "events": events})
+	writeJSON(w, code, map[string]any{
+		"ok": chOK, "clickhouse": chOK, "events": events,
+		"events_note": "physical rows (size gauge, includes duplicates/tombstoned)",
+	})
 }
 
 func (h *Handler) daily(w http.ResponseWriter, r *http.Request) {
@@ -121,13 +134,7 @@ func (h *Handler) followers(w http.ResponseWriter, r *http.Request) {
 // events is a minimal event query endpoint (clients usually use the ws relay,
 // but a REST mirror is handy).
 func (h *Handler) events(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	f := nostr.Filter{
-		Kinds:   parseInts(q["kind"]),
-		Authors: q["author"],
-		IDs:     q["id"],
-		Limit:   queryInt(r, "limit", 100),
-	}
+	f := eventsFilter(r.URL.Query(), h.breadth)
 	ch, err := h.store.QueryEvents(r.Context(), f)
 	if err != nil {
 		writeErr(w, err)
@@ -141,6 +148,24 @@ func (h *Handler) events(w http.ResponseWriter, r *http.Request) {
 }
 
 // --- helpers ---
+
+func eventsFilter(q url.Values, breadth policy.RejectFilterBreadth) nostr.Filter {
+	ids, authors := q["id"], q["author"]
+	if breadth.MaxIDs > 0 && len(ids) > breadth.MaxIDs {
+		ids = ids[:breadth.MaxIDs]
+	}
+	if breadth.MaxAuthors > 0 && len(authors) > breadth.MaxAuthors {
+		authors = authors[:breadth.MaxAuthors]
+	}
+	limit, err := strconv.Atoi(q.Get("limit"))
+	if err != nil || limit < 1 {
+		limit = 100
+	}
+	return nostr.Filter{
+		Kinds: parseInts(q["kind"]), Authors: authors, IDs: ids,
+		Limit: min(limit, 1000),
+	}
+}
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")

@@ -123,7 +123,7 @@ func TestStoreSaveAndQueryKind1(t *testing.T) {
 	if err := s.SaveEvent(ctx, n2); err != nil {
 		t.Fatalf("SaveEvent n2: %v", err)
 	}
-	s.FlushAll()
+	mustFlush(t, s)
 
 	// Query by author
 	ch, err := s.QueryEvents(ctx, nostr.Filter{Authors: []string{n1.PubKey}, Kinds: []int{1}})
@@ -172,7 +172,7 @@ func TestStoreTagQueries(t *testing.T) {
 	sk2 := nostr.GeneratePrivateKey()
 	reaction := signEvent(t, sk2, 7, "+", nostr.Tags{{"e", target.ID}}, 0)
 	s.SaveEvent(ctx, reaction)
-	s.FlushAll()
+	mustFlush(t, s)
 
 	// query by #e tag
 	ch, _ := s.QueryEvents(ctx, nostr.Filter{Tags: nostr.TagMap{"e": []string{target.ID}}})
@@ -184,7 +184,7 @@ func TestStoreTagQueries(t *testing.T) {
 	// query by #t tag (on root)
 	rootT := signEvent(t, sk, 1, "tagged", nostr.Tags{{"t", "bitcoin"}}, 0)
 	s.SaveEvent(ctx, rootT)
-	s.FlushAll()
+	mustFlush(t, s)
 	ch, _ = s.QueryEvents(ctx, nostr.Filter{Tags: nostr.TagMap{"t": []string{"bitcoin"}}})
 	got = drain(ch)
 	if len(got) != 1 || got[0].ID != rootT.ID {
@@ -200,7 +200,7 @@ func TestStoreDeleteTombstone(t *testing.T) {
 	sk := nostr.GeneratePrivateKey()
 	evt := signEvent(t, sk, 1, "doomed", nostr.Tags{}, 0)
 	s.SaveEvent(ctx, evt)
-	s.FlushAll()
+	mustFlush(t, s)
 
 	// visible before deletion
 	ch, _ := s.QueryEvents(ctx, nostr.Filter{IDs: []string{evt.ID}})
@@ -212,8 +212,7 @@ func TestStoreDeleteTombstone(t *testing.T) {
 	if err := s.DeleteEvent(ctx, evt); err != nil {
 		t.Fatalf("DeleteEvent: %v", err)
 	}
-	// reload dictionary so the tombstone predicate sees it immediately
-	_ = s.ch.Exec(ctx, "SYSTEM RELOAD DICTIONARY tombstone_dict")
+	waitTombstone(t, s, evt.ID)
 
 	ch, _ = s.QueryEvents(ctx, nostr.Filter{IDs: []string{evt.ID}})
 	got := drain(ch)
@@ -236,21 +235,41 @@ func TestStoreReplaceEvent(t *testing.T) {
 	sk := nostr.GeneratePrivateKey()
 	// older profile
 	old := signEvent(t, sk, 0, `{"name":"old"}`, nostr.Tags{}, 2*time.Hour)
-	s.ReplaceEvent(ctx, old)
-	s.FlushAll()
+	if err := s.ReplaceEvent(ctx, old); err != nil {
+		t.Fatalf("ReplaceEvent old: %v", err)
+	}
+	mustFlush(t, s)
 	// newer profile
 	newer := signEvent(t, sk, 0, `{"name":"new"}`, nostr.Tags{}, 1*time.Hour)
-	s.ReplaceEvent(ctx, newer)
-	s.FlushAll()
+	if err := s.ReplaceEvent(ctx, newer); err != nil {
+		t.Fatalf("ReplaceEvent newer: %v", err)
+	}
+	mustFlush(t, s)
 
 	// kind 0 is replaceable: only the latest version should be returned
-	ch, _ := s.QueryEvents(ctx, nostr.Filter{Authors: []string{old.PubKey}, Kinds: []int{0}})
+	// (LIMIT 1 BY collapse heals stored-but-unretired overlap immediately)
+	ch, err := s.QueryEvents(ctx, nostr.Filter{Authors: []string{old.PubKey}, Kinds: []int{0}})
+	if err != nil {
+		t.Fatalf("QueryEvents: %v", err)
+	}
 	got := drain(ch)
 	if len(got) != 1 {
 		t.Fatalf("expected exactly 1 replaceable version, got %d", len(got))
 	}
 	if got[0].Content != `{"name":"new"}` {
 		t.Fatalf("expected newest version, got %q", got[0].Content)
+	}
+	if got[0].ID != newer.ID {
+		t.Fatalf("expected newest id %s, got %s", newer.ID, got[0].ID)
+	}
+
+	waitTombstone(t, s, old.ID)
+	ch, err = s.QueryEvents(ctx, nostr.Filter{IDs: []string{old.ID}})
+	if err != nil {
+		t.Fatalf("QueryEvents old id: %v", err)
+	}
+	if n := drain(ch); len(n) != 0 {
+		t.Fatalf("expected old version retired, still visible: %v", n)
 	}
 }
 
@@ -264,12 +283,62 @@ func TestStoreRejectsOutOfScope(t *testing.T) {
 	if err := s.SaveEvent(ctx, gw); err == nil {
 		t.Fatal("expected SaveEvent to reject gift-wrap kind 1059")
 	}
-	s.FlushAll()
+	mustFlush(t, s)
 	var n uint64
 	_ = s.ch.QueryRow(ctx, fmt.Sprintf("SELECT count() FROM events_all WHERE id = '%s'", gw.ID)).Scan(&n)
 	if n != 0 {
 		t.Fatalf("expected 0 stored rows for dropped kind, got %d", n)
 	}
+}
+
+func mustFlush(t *testing.T, s *Store) {
+	t.Helper()
+	if err := s.FlushAll(); err != nil {
+		t.Fatalf("FlushAll: %v", err)
+	}
+}
+
+func waitTombstone(t *testing.T, s *Store, id string) {
+	t.Helper()
+	ctx := context.Background()
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		var n uint64
+		if err := s.ch.QueryRow(ctx, "SELECT count() FROM tombstones WHERE id = ?", id).Scan(&n); err != nil {
+			t.Fatalf("tombstones lookup: %v", err)
+		}
+		if n > 0 {
+			if err := s.ch.Exec(ctx, "SYSTEM RELOAD DICTIONARY tombstone_dict"); err != nil {
+				t.Fatalf("reload dict: %v", err)
+			}
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("tombstone row for %s not inserted in time", id)
+}
+
+func signEventAt(t *testing.T, sk string, kind int, content string, tags nostr.Tags, created nostr.Timestamp) *nostr.Event {
+	t.Helper()
+	pk, err := nostr.GetPublicKey(sk)
+	if err != nil {
+		t.Fatalf("GetPublicKey: %v", err)
+	}
+	evt := &nostr.Event{
+		PubKey:    pk,
+		CreatedAt: created,
+		Kind:      kind,
+		Tags:      tags,
+		Content:   content,
+	}
+	evt.ID = evt.GetID()
+	if err := evt.Sign(sk); err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	if !evt.CheckID() {
+		t.Fatal("CheckID failed")
+	}
+	return evt
 }
 
 func drain(ch chan *nostr.Event) []*nostr.Event {
@@ -319,10 +388,221 @@ func TestStoreOnFlushedFiresAfterFlush(t *testing.T) {
 	}
 
 	// Now flush — the hook fires, recording durable state only once safe.
-	s.FlushAll()
+	mustFlush(t, s)
 	mu.Lock()
 	defer mu.Unlock()
 	if len(flushed) != 1 || flushed[0] != evt.ID {
 		t.Fatalf("OnFlushed should have recorded the event post-flush, got %v", flushed)
 	}
+}
+
+func TestQueryEventsMixedReplaceableKinds(t *testing.T) {
+	// Codex BLOCKER 1: LIMIT 1 BY must include kind, otherwise same-author
+	// kind-0 and kind-3 collapse onto one pubkey key and one disappears.
+	s, _, teardown := setupStore(t)
+	defer teardown()
+	ctx := context.Background()
+
+	sk := nostr.GeneratePrivateKey()
+	old0 := signEvent(t, sk, 0, `{"name":"old"}`, nostr.Tags{}, 3*time.Hour)
+	new0 := signEvent(t, sk, 0, `{"name":"new"}`, nostr.Tags{}, 1*time.Hour)
+	old3 := signEvent(t, sk, 3, `["old-contacts"]`, nostr.Tags{}, 3*time.Hour)
+	new3 := signEvent(t, sk, 3, `["new-contacts"]`, nostr.Tags{}, 1*time.Hour)
+	for _, e := range []*nostr.Event{old0, new0, old3, new3} {
+		if err := s.SaveEvent(ctx, e); err != nil {
+			t.Fatalf("SaveEvent: %v", err)
+		}
+	}
+	mustFlush(t, s)
+
+	ch, err := s.QueryEvents(ctx, nostr.Filter{Authors: []string{old0.PubKey}, Kinds: []int{0, 3}})
+	if err != nil {
+		t.Fatalf("QueryEvents: %v", err)
+	}
+	got := drain(ch)
+	if len(got) != 2 {
+		t.Fatalf("expected both newest kind-0 and kind-3, got %d: %v", len(got), contents(got))
+	}
+	seen := map[int]string{}
+	for _, e := range got {
+		seen[e.Kind] = e.Content
+	}
+	if seen[0] != `{"name":"new"}` {
+		t.Fatalf("kind 0 = %q, want newest profile", seen[0])
+	}
+	if seen[3] != `["new-contacts"]` {
+		t.Fatalf("kind 3 = %q, want newest contacts", seen[3])
+	}
+}
+
+func TestQueryEventsKind3NewestAndEqualTSTiebreak(t *testing.T) {
+	s, _, teardown := setupStore(t)
+	defer teardown()
+	ctx := context.Background()
+
+	sk := nostr.GeneratePrivateKey()
+	pk, _ := nostr.GetPublicKey(sk)
+
+	v1 := signEvent(t, sk, 3, "contacts-v1", nostr.Tags{}, 3*time.Hour)
+	v2 := signEvent(t, sk, 3, "contacts-v2", nostr.Tags{}, 2*time.Hour)
+	v3 := signEvent(t, sk, 3, "contacts-v3", nostr.Tags{}, 1*time.Hour)
+	for _, e := range []*nostr.Event{v1, v2, v3} {
+		if err := s.SaveEvent(ctx, e); err != nil {
+			t.Fatalf("SaveEvent: %v", err)
+		}
+	}
+	mustFlush(t, s)
+
+	ch, err := s.QueryEvents(ctx, nostr.Filter{Authors: []string{pk}, Kinds: []int{3}})
+	if err != nil {
+		t.Fatalf("QueryEvents: %v", err)
+	}
+	got := drain(ch)
+	if len(got) != 1 {
+		t.Fatalf("expected exactly newest kind-3, got %d: %v", len(got), contents(got))
+	}
+	if got[0].ID != v3.ID {
+		t.Fatalf("expected v3 %s, got %s (%q)", v3.ID, got[0].ID, got[0].Content)
+	}
+
+	// Equal-timestamp versions: lowest id wins (NIP-01 / ORDER BY id ASC).
+	sk2 := nostr.GeneratePrivateKey()
+	ts := nostr.Timestamp(1_700_000_000)
+	a := signEventAt(t, sk2, 3, "eq-a", nostr.Tags{}, ts)
+	b := signEventAt(t, sk2, 3, "eq-b", nostr.Tags{}, ts)
+	low, high := a, b
+	if low.ID > high.ID {
+		low, high = high, low
+	}
+	if err := s.SaveEvent(ctx, high); err != nil {
+		t.Fatalf("SaveEvent high: %v", err)
+	}
+	if err := s.SaveEvent(ctx, low); err != nil {
+		t.Fatalf("SaveEvent low: %v", err)
+	}
+	mustFlush(t, s)
+
+	ch, err = s.QueryEvents(ctx, nostr.Filter{Authors: []string{low.PubKey}, Kinds: []int{3}})
+	if err != nil {
+		t.Fatalf("QueryEvents equal-ts: %v", err)
+	}
+	got = drain(ch)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 equal-ts winner, got %d: %v", len(got), contents(got))
+	}
+	if got[0].ID != low.ID {
+		t.Fatalf("equal-ts tiebreak: got %s, want lowest id %s (high=%s)", got[0].ID, low.ID, high.ID)
+	}
+}
+
+func TestQueryEventsDupIDCollapse(t *testing.T) {
+	s, _, teardown := setupStore(t)
+	defer teardown()
+	ctx := context.Background()
+
+	sk := nostr.GeneratePrivateKey()
+	evt := signEvent(t, sk, 1, "dup-me", nostr.Tags{{"t", "dup"}}, 0)
+	if err := s.SaveEvent(ctx, evt); err != nil {
+		t.Fatalf("SaveEvent 1: %v", err)
+	}
+	mustFlush(t, s)
+	if err := s.SaveEvent(ctx, evt); err != nil {
+		t.Fatalf("SaveEvent 2: %v", err)
+	}
+	mustFlush(t, s)
+
+	var raw uint64
+	if err := s.ch.QueryRow(ctx, "SELECT count() FROM events_archive WHERE id = ?", evt.ID).Scan(&raw); err != nil {
+		t.Fatalf("raw count: %v", err)
+	}
+	if raw < 2 {
+		t.Fatalf("expected at least 2 physical rows for dup id, got %d", raw)
+	}
+
+	ch, err := s.QueryEvents(ctx, nostr.Filter{IDs: []string{evt.ID}})
+	if err != nil {
+		t.Fatalf("QueryEvents: %v", err)
+	}
+	got := drain(ch)
+	if len(got) != 1 {
+		t.Fatalf("expected dup-id collapse to 1, got %d", len(got))
+	}
+	if got[0].ID != evt.ID {
+		t.Fatalf("got id %s, want %s", got[0].ID, evt.ID)
+	}
+}
+
+func TestReplaceEventEqualTimestampLowerIDWins(t *testing.T) {
+	s, _, teardown := setupStore(t)
+	defer teardown()
+	ctx := context.Background()
+
+	sk := nostr.GeneratePrivateKey()
+	ts := nostr.Timestamp(1_700_000_100)
+	a := signEventAt(t, sk, 0, `{"name":"a"}`, nostr.Tags{}, ts)
+	b := signEventAt(t, sk, 0, `{"name":"b"}`, nostr.Tags{}, ts)
+	low, high := a, b
+	if low.ID > high.ID {
+		low, high = high, low
+	}
+
+	if err := s.ReplaceEvent(ctx, high); err != nil {
+		t.Fatalf("ReplaceEvent high: %v", err)
+	}
+	mustFlush(t, s)
+	if err := s.ReplaceEvent(ctx, low); err != nil {
+		t.Fatalf("ReplaceEvent low: %v", err)
+	}
+	mustFlush(t, s)
+
+	ch, err := s.QueryEvents(ctx, nostr.Filter{Authors: []string{low.PubKey}, Kinds: []int{0}})
+	if err != nil {
+		t.Fatalf("QueryEvents: %v", err)
+	}
+	got := drain(ch)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 winner, got %d: %v", len(got), contents(got))
+	}
+	if got[0].ID != low.ID {
+		t.Fatalf("equal-ts ReplaceEvent: got %s, want lowest id %s", got[0].ID, low.ID)
+	}
+
+	// Incoming higher-id at the same timestamp must be discarded.
+	if err := s.ReplaceEvent(ctx, high); err != nil {
+		t.Fatalf("ReplaceEvent high again: %v", err)
+	}
+	mustFlush(t, s)
+	ch, err = s.QueryEvents(ctx, nostr.Filter{Authors: []string{low.PubKey}, Kinds: []int{0}})
+	if err != nil {
+		t.Fatalf("QueryEvents 2: %v", err)
+	}
+	got = drain(ch)
+	if len(got) != 1 || got[0].ID != low.ID {
+		t.Fatalf("higher-id at equal ts should stay discarded, got %v", contents(got))
+	}
+}
+
+func TestQueryEventsSynchronousError(t *testing.T) {
+	s, _, teardown := setupStore(t)
+	defer teardown()
+	ctx := context.Background()
+
+	if err := s.ch.Exec(ctx, "DROP TABLE events_archive"); err != nil {
+		t.Fatalf("DROP TABLE: %v", err)
+	}
+	ch, err := s.QueryEvents(ctx, nostr.Filter{Kinds: []int{1}})
+	if err == nil {
+		t.Fatal("expected synchronous error after dropping tier table")
+	}
+	if ch != nil {
+		t.Fatalf("expected nil channel on error, got %v", ch)
+	}
+}
+
+func contents(ev []*nostr.Event) []string {
+	out := make([]string, len(ev))
+	for i, e := range ev {
+		out[i] = fmt.Sprintf("kind=%d id=%s content=%q", e.Kind, e.ID, e.Content)
+	}
+	return out
 }

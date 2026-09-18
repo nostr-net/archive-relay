@@ -158,3 +158,74 @@ func TestManagementAPIAllowEnrolls(t *testing.T) {
 		t.Error("static config key should still be allowed")
 	}
 }
+
+// --- default-since (OverwriteFilter) ---
+
+func applyOverwrite(t *testing.T, hooks []func(context.Context, *nostr.Filter), f nostr.Filter) nostr.Filter {
+	t.Helper()
+	for _, fn := range hooks {
+		fn(context.Background(), &f)
+	}
+	return f
+}
+
+func TestDefaultSinceInjectedOnPureFeed(t *testing.T) {
+	rl := New(Deps{DefaultSinceHours: 48})
+	if len(rl.OverwriteFilter) == 0 {
+		t.Fatal("OverwriteFilter hook should be appended when DefaultSinceHours > 0")
+	}
+
+	for _, f := range []nostr.Filter{
+		{Kinds: []int{1}}, // {kinds:[1]} with nothing else IS a global feed
+		{},                // fully empty REQ is also a global feed
+	} {
+		got := applyOverwrite(t, rl.OverwriteFilter, f)
+		if got.Since == nil {
+			t.Fatalf("pure feed %+v should get Since injected", f)
+		}
+		want := nostr.Now() - 48*3600
+		delta := int64(*got.Since) - int64(want)
+		if delta < -2 || delta > 2 {
+			t.Errorf("Since = %d, want ≈ now−48h (%d), delta=%d", *got.Since, want, delta)
+		}
+	}
+}
+
+func TestDefaultSinceSkipsNonFeedShapes(t *testing.T) {
+	rl := New(Deps{DefaultSinceHours: 48})
+	until := nostr.Now() - 86400
+	existing := nostr.Now() - 3600
+
+	cases := []struct {
+		name string
+		f    nostr.Filter
+	}{
+		{"until", nostr.Filter{Kinds: []int{1}, Until: &until}},
+		{"tags", nostr.Filter{Tags: nostr.TagMap{"e": {"abc"}}}},
+		{"ids", nostr.Filter{IDs: []string{"abc"}}},
+		{"authors", nostr.Filter{Authors: []string{"pk"}}},
+		{"since", nostr.Filter{Since: &existing}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			origSince := tc.f.Since
+			got := applyOverwrite(t, rl.OverwriteFilter, tc.f)
+			switch {
+			case origSince == nil && got.Since != nil:
+				t.Errorf("filter was mutated: Since=%v", *got.Since)
+			case origSince != nil && (got.Since == nil || *got.Since != *origSince):
+				t.Errorf("existing Since was changed: got %v want %v", got.Since, origSince)
+			}
+			if tc.f.Until != nil && got.Until != tc.f.Until {
+				t.Error("Until pointer should be untouched")
+			}
+		})
+	}
+}
+
+func TestDefaultSinceDisabledWhenZero(t *testing.T) {
+	rl := New(Deps{})
+	if len(rl.OverwriteFilter) != 0 {
+		t.Errorf("OverwriteFilter should be empty when DefaultSinceHours=0, got %d hooks", len(rl.OverwriteFilter))
+	}
+}

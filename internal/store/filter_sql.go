@@ -12,12 +12,22 @@ import (
 // Limit is unspecified or absurd. Archives often raise this; 1000 is a safe default.
 const defaultQueryLimit = 1000
 
+// collapseLimitBy is the QueryEvents tail fragment that collapses replaceable
+// versions and exact-id duplicates. kind MUST be in the group key: without it
+// an author's kind-0 profile and kind-3 contacts share the pubkey key and one
+// disappears (codex BLOCKER 1).
+//
+// Semantic: "latest matching version" — this runs AFTER WHERE, so a tag/until
+// filter can return an older version when the newest does not match.
+const collapseLimitBy = "LIMIT 1 BY kind, if(kind IN (0,3,10002), pubkey, id)"
+
 // buildFilterSQL turns a nostr.Filter into a WHERE clause + positional args
-// (for clickhouse-go's `?` binding) + an ORDER/LIMIT tail. It is a near-1:1
-// port of eventstore/postgresql/query.go, adapted to ClickHouse types:
+// (for clickhouse-go's `?` binding) + an ORDER/LIMIT-BY/LIMIT tail. It is a
+// near-1:1 port of eventstore/postgresql/query.go, adapted to ClickHouse types:
 //   - tag predicates use hasAny(Array, Array) on the denormalized tag_* columns
 //   - the tombstone predicate `NOT dictHas('tombstone_dict', id)` is always added
-//   - replaceable/addressable dedup is handled by the caller via FINAL, not here
+//   - replaceable collapse is the tail's LIMIT 1 BY (QueryEvents); CountEvents
+//     ignores the tail and keeps FINAL (§1.10)
 //
 // The hot single-letter tags e/p/t/d are first-class; arbitrary tag keys (r, a,
 // custom) fall back to a tags_raw substring scan (slower, but rare).
@@ -92,6 +102,6 @@ func buildFilterSQL(f nostr.Filter) (where string, args []any, tail string) {
 	if limit < 1 || limit > defaultQueryLimit {
 		limit = defaultQueryLimit
 	}
-	tail = fmt.Sprintf(" ORDER BY created_at DESC, id LIMIT %d", limit)
+	tail = fmt.Sprintf(" ORDER BY created_at DESC, id ASC %s LIMIT %d", collapseLimitBy, limit)
 	return where, args, tail
 }

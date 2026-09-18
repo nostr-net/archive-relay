@@ -2,6 +2,8 @@ package control
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -153,5 +155,150 @@ func TestMarkFetchedUpserts(t *testing.T) {
 	}
 	if last2 < last1 {
 		t.Errorf("last_fetched went backwards: %d -> %d", last1, last2)
+	}
+}
+
+func TestLastFullSweepMigrationIdempotent(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	path := filepath.Join(t.TempDir(), "control.db")
+
+	db1, err := Open(path, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := db1.conn.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('crawl_state') WHERE name = 'last_full_sweep'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("fresh Open missing last_full_sweep column (count=%d)", n)
+	}
+	if err := db1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db2, err := Open(path, log)
+	if err != nil {
+		t.Fatalf("second Open (idempotent migrate) failed: %v", err)
+	}
+	t.Cleanup(func() { _ = db2.Close() })
+	if err := db2.conn.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('crawl_state') WHERE name = 'last_full_sweep'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("second Open dropped or duplicated last_full_sweep (count=%d)", n)
+	}
+}
+
+func TestLastFullSweepMigratesOldSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`
+CREATE TABLE crawl_state (
+  pubkey        TEXT PRIMARY KEY,
+  last_fetched  INTEGER NOT NULL DEFAULT 0,
+  updated_at    INTEGER NOT NULL DEFAULT 0
+)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	db, err := Open(path, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	var n int
+	if err := db.conn.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('crawl_state') WHERE name = 'last_full_sweep'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("migrate did not add last_full_sweep (count=%d)", n)
+	}
+}
+
+func TestMarkSweptLastSweptRoundtrip(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+
+	got, err := db.LastSwept(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 0 {
+		t.Errorf("LastSwept of unknown pubkey = %d, want 0", got)
+	}
+
+	if err := db.MarkFetched(ctx, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	fetched, err := db.LastFetched(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fetched == 0 {
+		t.Fatal("MarkFetched should set last_fetched")
+	}
+
+	if err := db.MarkSwept(ctx, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	swept, err := db.LastSwept(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if swept == 0 {
+		t.Error("MarkSwept should set last_full_sweep")
+	}
+
+	fetched2, err := db.LastFetched(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fetched2 != fetched {
+		t.Errorf("MarkSwept clobbered last_fetched: %d -> %d", fetched, fetched2)
+	}
+
+	if err := db.MarkSwept(ctx, "bob"); err != nil {
+		t.Fatal(err)
+	}
+	bobFetched, err := db.LastFetched(ctx, "bob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bobFetched != 0 {
+		t.Errorf("MarkSwept-only row last_fetched = %d, want 0", bobFetched)
+	}
+}
+
+func TestPruneSeenByRowidExactCap(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	const cap = 3
+	for i := 0; i < cap+3; i++ {
+		if _, err := db.MarkSeen(ctx, fmt.Sprintf("id-%d", i), int64(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	n, err := db.PruneSeenByRowid(ctx, cap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Errorf("deleted %d, want 3", n)
+	}
+	ids, err := db.LoadRecentSeen(ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != cap {
+		t.Errorf("remaining %d, want exactly cap=%d", len(ids), cap)
 	}
 }

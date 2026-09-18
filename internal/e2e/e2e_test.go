@@ -120,7 +120,7 @@ func buildHarness(t *testing.T, schedBuffer time.Duration, allow, admin []string
 		schedBuffer, log)
 	krl = relay.New(relay.Deps{Store: s, Sched: sched, Access: access, ServiceURL: "ws://" + addr})
 	go sched.Run(ctx)
-	api.NewHandler(svc, s, nil, access, log).Register(krl.Router())
+	api.NewHandler(svc, s, nil, access, policy.RejectFilterBreadth{}, log).Register(krl.Router())
 
 	srv := &http.Server{Handler: krl}
 	go srv.Serve(ln)

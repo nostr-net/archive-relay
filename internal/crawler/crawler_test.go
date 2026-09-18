@@ -72,10 +72,13 @@ func TestCrawlerIngestsFromLiveRelay(t *testing.T) {
 	}
 	defer s.Close()
 
-	cr := New([]string{src}, s, NewDedup(cdb, log.With("pkg", "dedup")), log.With("pkg", "crawler"))
+	dedup := NewDedup(cdb, log.With("pkg", "dedup"))
+	cr := New([]string{src}, s, dedup, log.With("pkg", "crawler"))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
+	dedup.StartWriter(ctx)
+	defer dedup.StopWriter()
 	go cr.Run(ctx)
 
 	// let it ingest
