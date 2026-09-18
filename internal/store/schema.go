@@ -172,14 +172,23 @@ func (s *Store) initSchema(ctx context.Context) error {
 	}
 	for _, tier := range activeTiers {
 		table := "events_" + tier
-		// Was idx_pubkey just created (fresh/migrated install)? Only then queue
-		// a MATERIALIZE mutation — running it every startup would re-queue a
-		// mutation on all parts each boot (grok review #7).
-		var haveIdx uint64
+		// Was idx_pubkey just created, or has a materialize mutation never been
+		// queued? Only then queue one — running MATERIALIZE every startup would
+		// re-queue a mutation on all parts each boot, and skipping it after a
+		// failed first attempt would never backfill old parts (grok r2 #11).
+		var haveIdx, matTotal uint64
 		if err := s.wch.QueryRow(ctx,
 			"SELECT count() FROM system.data_skipping_indices WHERE database = currentDatabase() AND table = ? AND name = 'idx_pubkey'",
 			table).Scan(&haveIdx); err != nil {
 			return fmt.Errorf("index introspection failed for %q: %w", table, err)
+		}
+		if err := s.wch.QueryRow(ctx,
+			"SELECT count() FROM system.mutations WHERE database = currentDatabase() AND table = ? AND command LIKE '%materialize_index%'",
+			table).Scan(&matTotal); err != nil {
+			// system.mutations may be restricted on some installs; treat as
+			// "unknown" and keep the conservative once-only behavior
+			matTotal = 1
+			s.log.Warn("mutation introspection unavailable; assuming materialize already queued", "table", table, "err", err)
 		}
 		for _, ddl := range []string{
 			"ALTER TABLE " + table + " ADD COLUMN IF NOT EXISTS tags Array(Array(String)) DEFAULT " + tagsDefaultExpr + " AFTER tags_raw",
@@ -195,7 +204,7 @@ func (s *Store) initSchema(ctx context.Context) error {
 				return fmt.Errorf("schema column/index migration failed on %q: %w", truncate(ddl, 80), err)
 			}
 		}
-		if haveIdx == 0 {
+		if haveIdx == 0 || matTotal == 0 {
 			if err := s.wch.Exec(ctx, "ALTER TABLE "+table+" MATERIALIZE INDEX idx_pubkey"); err != nil {
 				if strings.Contains(strings.ToLower(err.Error()), "already exists") {
 					s.log.Info("pubkey index materialization already exists", "table", table, "err", err)

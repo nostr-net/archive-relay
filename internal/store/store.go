@@ -271,10 +271,14 @@ func (s *Store) ReplaceEvent(ctx context.Context, evt *nostr.Event) error {
 		if err := s.SaveEvent(ctx, evt); err != nil {
 			return err
 		}
-		if b, ok := s.tiers[tierForEvent(evt, s.cfg.Classifier)]; ok {
-			if err := b.FlushAll(); err != nil {
-				return fmt.Errorf("flush new version before retire: %w", err)
-			}
+		b, ok := s.tiers[tierForEvent(evt, s.cfg.Classifier)]
+		if !ok {
+			// unreachable today (SaveEvent uses the same map), but a missing
+			// batcher must abort the retire — enqueue ≠ stored (grok r2 #12)
+			return fmt.Errorf("no batcher for tier %q", tierForEvent(evt, s.cfg.Classifier))
+		}
+		if err := b.FlushAll(); err != nil {
+			return fmt.Errorf("flush new version before retire: %w", err)
 		}
 	}
 	if len(retire) > 0 {
@@ -433,13 +437,6 @@ func (s *Store) CountEvents(ctx context.Context, f nostr.Filter) (int64, error) 
 	return total, nil
 }
 
-// acquireRead takes one admission token. If all tokens are held, the caller
-// joins a bounded waiter queue (cap 16) that is also ctx-cancellable.
-// Overflow of the waiter queue returns ErrReadBusy immediately so khatru
-// can NOTICE rather than accumulating unbounded blocked REQs (codex #11).
-// khatru internal calls (NIP-09 delete lookups) bypass admission entirely:
-// a delete lookup failing on ErrReadBusy would silently skip tombstoning
-// that id — correctness of hides outranks the bound.
 // acquireRead takes one admission token and returns the matching release
 // func. If all tokens are held, the caller joins a bounded waiter queue
 // (cap 16) that is also ctx-cancellable. Overflow returns ErrReadBusy

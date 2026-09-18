@@ -156,7 +156,7 @@ func (w *tombstoneWriter) run() {
 			shutdownCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 			defer cancel()
 			ctx = shutdownCtx
-			grace := false
+			emptyRounds := 0
 			for {
 				select {
 				case req := <-w.in:
@@ -164,11 +164,15 @@ func (w *tombstoneWriter) run() {
 					if len(buf) >= tombstoneBatchMax && !retrying {
 						flush()
 					}
+					emptyRounds = 0
 				default:
-					if !grace {
-						// one grace sweep: a producer send could commit in the same
-						// scheduler interleave that hit this default
-						grace = true
+					// Producers abort on the closed stopCh BEFORE each push, but a
+					// select whose send+stopCh are both ready can still commit the
+					// send. Require TWO consecutive empty observations 50ms apart
+					// before finishing (grok review r2 #10): any id that landed is
+					// drained, not dropped.
+					emptyRounds++
+					if emptyRounds < 2 {
 						time.Sleep(50 * time.Millisecond)
 						continue
 					}
