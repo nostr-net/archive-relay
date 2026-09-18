@@ -234,6 +234,14 @@ func (s *Store) ReplaceEvent(ctx context.Context, evt *nostr.Event) error {
 		return s.SaveEvent(ctx, evt)
 	}
 
+	// A previous version may still be in a batcher buffer (published seconds
+	// ago, not yet in ClickHouse) — flush so the probe sees it; otherwise a
+	// superseded version can survive unretired (read collapse still heals the
+	// common case; equal-timestamp edges need the probe complete).
+	if err := s.FlushAll(); err != nil {
+		s.log.Warn("flush before replace probe failed", "err", err)
+	}
+
 	release, err := s.acquireRead(ctx)
 	if err != nil {
 		return fmt.Errorf("replace probe: %w", err)
@@ -339,6 +347,17 @@ func (s *Store) probeReplaceable(ctx context.Context, evt *nostr.Event) ([]repla
 // (khatru then sends NOTICE) before the result channel is created. The
 // collected rows are then streamed through a buffered channel.
 func (s *Store) QueryEvents(ctx context.Context, f nostr.Filter) (chan *nostr.Event, error) {
+	// NIP-09 lookups (khatru internal calls) query by id for an event the
+	// client may have published SECONDS ago — which can still be sitting in
+	// a tier batcher, invisible to ClickHouse. A missed lookup means the
+	// tombstone is never written and the "deleted" event is served forever.
+	// Flush first so deletes of just-published events land (internal calls
+	// are rare — deletes + expirations — so the forced flush is cheap).
+	if khatru.IsInternalCall(ctx) {
+		if err := s.FlushAll(); err != nil {
+			s.log.Warn("flush before internal lookup failed", "err", err)
+		}
+	}
 	release, err := s.acquireRead(ctx)
 	if err != nil {
 		return nil, err
