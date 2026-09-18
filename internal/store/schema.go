@@ -7,10 +7,25 @@ import (
 )
 
 // tierColumns is the canonical column list for every tier table, in INSERT order.
-// (received_at has a DEFAULT; version is MATERIALIZED — neither is inserted.)
-const tierColumns = `id, pubkey, created_at, kind, content, sig, tags_raw, tag_e, tag_p, tag_t, tag_d, reply_to`
+// tags_raw is dual-written for rollback; tag_e/p/t/d and received_at have DEFAULT
+// expressions and are omitted; version is MATERIALIZED.
+const tierColumns = `id, pubkey, created_at, kind, content, sig, tags_raw, tags, reply_to`
 
-const tierColumnsType = `
+// DEFAULT expressions for native tags and the tag_* accelerators. tag_* are
+// DEFAULT rather than MATERIALIZED: on CH 26.9.1 MATERIALIZED columns are
+// omitted from SELECT *, which would strip accelerators from events_all and
+// break stats (tag_e / tag_p). DEFAULT columns are stored, appear in SELECT *,
+// and still accept explicit INSERT (rollback of the Go INSERT list).
+const (
+	tagsDefaultExpr = `JSONExtract(tags_raw, 'Array(Array(String))')`
+	tagEDefaultExpr = `arrayMap(x -> x[2], arrayFilter(x -> length(x) >= 2 AND x[1] = 'e', tags))`
+	tagPDefaultExpr = `arrayMap(x -> x[2], arrayFilter(x -> length(x) >= 2 AND x[1] = 'p', tags))`
+	tagTDefaultExpr = `arrayMap(x -> x[2], arrayFilter(x -> length(x) >= 2 AND x[1] = 't', tags))`
+	tagDDefaultExpr = `arrayFirst(x -> length(x) >= 2 AND x[1] = 'd', tags)[2]`
+)
+
+func tierColumnsType() string {
+	return `
   id           String,
   pubkey       String,
   created_at   UInt32,
@@ -18,10 +33,11 @@ const tierColumnsType = `
   content      String,
   sig          String,
   tags_raw     String,
-  tag_e        Array(String),
-  tag_p        Array(String),
-  tag_t        Array(String),
-  tag_d        String,
+  tags         Array(Array(String)) DEFAULT ` + tagsDefaultExpr + `,
+  tag_e        Array(String) DEFAULT ` + tagEDefaultExpr + `,
+  tag_p        Array(String) DEFAULT ` + tagPDefaultExpr + `,
+  tag_t        Array(String) DEFAULT ` + tagTDefaultExpr + `,
+  tag_d        String DEFAULT ` + tagDDefaultExpr + `,
   reply_to     String,
   received_at  DateTime64(3) DEFAULT now64(3),
   version      UInt32 MATERIALIZED created_at,
@@ -31,6 +47,7 @@ const tierColumnsType = `
   INDEX idx_tag_t   tag_t   TYPE bloom_filter(0.01) GRANULARITY 4,
   INDEX idx_pubkey pubkey TYPE bloom_filter(0.01) GRANULARITY 4
 `
+}
 
 // tierDDL builds a CREATE TABLE statement for one tier. ttlDelete of "" means
 // keep forever. The interval is expressed as e.g. "10 YEAR" / "1 YEAR" / "30 DAY"
@@ -50,7 +67,7 @@ CREATE TABLE IF NOT EXISTS events_%[1]s (%[2]s
   PARTITION BY toYYYYMM(toDateTime(created_at))
   ORDER BY (kind, pubkey, created_at, id)%[3]s
   SETTINGS index_granularity = 8192;
-`, name, tierColumnsType, ttl)
+`, name, tierColumnsType(), ttl)
 }
 
 // eventsViewDDL builds the UNION ALL view over all tiers (used by stats and
@@ -120,6 +137,20 @@ CREATE TABLE IF NOT EXISTS author_follower_counts_staging (
 ) ENGINE = MergeTree ORDER BY pubkey;
 `
 
+// execParts splits a multi-statement DDL blob and Execs each piece.
+func (s *Store) execParts(ctx context.Context, q string) error {
+	for _, part := range strings.Split(q, ";") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if err := s.ch.Exec(ctx, part); err != nil {
+			return fmt.Errorf("schema init failed on %q: %w", truncate(part, 80), err)
+		}
+	}
+	return nil
+}
+
 // initSchema runs all DDL idempotently.
 func (s *Store) initSchema(ctx context.Context) error {
 	ttl := map[string]string{
@@ -127,31 +158,31 @@ func (s *Store) initSchema(ctx context.Context) error {
 		TierArchive:   s.cfg.Retention.Archive,
 		TierSocial:    s.cfg.Retention.Social,
 	}
-	stmts := []string{}
 	for _, t := range activeTiers {
-		stmts = append(stmts, tierDDL(t, ttl[t]))
-	}
-	stmts = append(stmts, eventsViewDDL(), tombstonesDDL, snapshotsDDL)
-	for _, q := range stmts {
-		// split on ';' — clickhouse-go executes one statement per Exec
-		for _, part := range strings.Split(q, ";") {
-			part = strings.TrimSpace(part)
-			if part == "" {
-				continue
-			}
-			if err := s.ch.Exec(ctx, part); err != nil {
-				return fmt.Errorf("schema init failed on %q: %w", truncate(part, 80), err)
-			}
+		if err := s.execParts(ctx, tierDDL(t, ttl[t])); err != nil {
+			return err
 		}
+	}
+	if err := s.execParts(ctx, tombstonesDDL); err != nil {
+		return err
+	}
+	if err := s.execParts(ctx, snapshotsDDL); err != nil {
+		return err
 	}
 	for _, tier := range activeTiers {
 		table := "events_" + tier
 		for _, ddl := range []string{
+			"ALTER TABLE " + table + " ADD COLUMN IF NOT EXISTS tags Array(Array(String)) DEFAULT " + tagsDefaultExpr + " AFTER tags_raw",
+			"ALTER TABLE " + table + " MODIFY COLUMN tags Array(Array(String)) DEFAULT " + tagsDefaultExpr,
+			"ALTER TABLE " + table + " MODIFY COLUMN tag_e Array(String) DEFAULT " + tagEDefaultExpr,
+			"ALTER TABLE " + table + " MODIFY COLUMN tag_p Array(String) DEFAULT " + tagPDefaultExpr,
+			"ALTER TABLE " + table + " MODIFY COLUMN tag_t Array(String) DEFAULT " + tagTDefaultExpr,
+			"ALTER TABLE " + table + " MODIFY COLUMN tag_d String DEFAULT " + tagDDefaultExpr,
 			"ALTER TABLE " + table + " ADD INDEX IF NOT EXISTS idx_pubkey pubkey TYPE bloom_filter(0.01) GRANULARITY 4",
 			"ALTER TABLE " + table + " DROP INDEX IF EXISTS idx_content",
 		} {
 			if err := s.ch.Exec(ctx, ddl); err != nil {
-				return fmt.Errorf("schema index migration failed on %q: %w", ddl, err)
+				return fmt.Errorf("schema column/index migration failed on %q: %w", truncate(ddl, 80), err)
 			}
 		}
 		if err := s.ch.Exec(ctx, "ALTER TABLE "+table+" MATERIALIZE INDEX idx_pubkey"); err != nil {
@@ -161,6 +192,17 @@ func (s *Store) initSchema(ctx context.Context) error {
 				s.log.Warn("pubkey index materialization failed; will retry at next startup", "table", table, "err", err)
 			}
 		}
+		// Mutation is queued (mutations_sync=0); do not wait for is_done.
+		backfill := "ALTER TABLE " + table + " UPDATE tags = JSONExtract(tags_raw, 'Array(Array(String))') WHERE empty(tags)"
+		if err := s.ch.Exec(ctx, backfill); err != nil {
+			s.log.Warn("tags backfill mutation failed; will retry at next startup", "table", table, "err", err)
+		} else {
+			s.log.Info("tags backfill mutation submitted", "table", table)
+		}
+	}
+	// Recreate the view after every tier has the same columns so SELECT * unions.
+	if err := s.execParts(ctx, eventsViewDDL()); err != nil {
+		return err
 	}
 	var found uint8
 	if err := s.ch.QueryRow(ctx, "SELECT dictHas('tombstone_dict', '0000000000000000000000000000000000000000000000000000000000000000')").Scan(&found); err != nil {

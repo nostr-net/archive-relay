@@ -300,24 +300,8 @@ func (b *batcher) flushContext(ctx context.Context, events []*nostr.Event) error
 }
 
 // rowFromEvent extracts a tier-table row (matching tierColumns order) from an event.
+// tag_e/p/t/d are DEFAULT-derived from tags in ClickHouse and are not inserted.
 func rowFromEvent(evt *nostr.Event) []any {
-	var tagE, tagP, tagT []string
-	var tagD string
-	for _, t := range evt.Tags {
-		if len(t) < 2 {
-			continue
-		}
-		switch t[0] {
-		case "e":
-			tagE = append(tagE, t[1])
-		case "p":
-			tagP = append(tagP, t[1])
-		case "t":
-			tagT = append(tagT, t[1])
-		case "d":
-			tagD = t[1] // first d-tag wins; addressable kinds have one
-		}
-	}
 	tagsJSON, _ := json.Marshal(evt.Tags)
 	return []any{
 		evt.ID,
@@ -327,12 +311,28 @@ func rowFromEvent(evt *nostr.Event) []any {
 		evt.Content,
 		evt.Sig,
 		string(tagsJSON),
-		tagE,
-		tagP,
-		tagT,
-		tagD,
+		nativeTags(evt.Tags),
 		replyTarget(evt.Tags), // NIP-10-resolved direct parent, or "" if not a reply
 	}
+}
+
+// nativeTags copies nostr tags into [][]string for Array(Array(String)).
+// Never returns nil — ClickHouse would store NULL rather than [].
+func nativeTags(tags nostr.Tags) [][]string {
+	out := make([][]string, len(tags))
+	for i, t := range tags {
+		out[i] = append([]string(nil), t...)
+	}
+	return out
+}
+
+// nostrTags copies a scanned Array(Array(String)) into nostr.Tags.
+func nostrTags(in [][]string) nostr.Tags {
+	out := make(nostr.Tags, len(in))
+	for i, t := range in {
+		out[i] = append(nostr.Tag(nil), t...)
+	}
+	return out
 }
 
 // replyTarget resolves the direct parent of a reply per NIP-10:

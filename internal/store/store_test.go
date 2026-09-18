@@ -2,8 +2,10 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -194,6 +196,79 @@ func TestAcquireReadCtxCancel(t *testing.T) {
 	err := s.acquireRead(ctx)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("got %v, want context.Canceled", err)
+	}
+}
+
+func TestRowFromEventNativeTags(t *testing.T) {
+	evt := &nostr.Event{
+		ID:        "id1",
+		PubKey:    "pk1",
+		CreatedAt: 1_700_000_000,
+		Kind:      1,
+		Content:   "hello",
+		Sig:       "sig1",
+		Tags: nostr.Tags{
+			{"e", "eid", "wss://r", "reply"},
+			{"p", "pk2"},
+			{"t", "btc"},
+			{"d", "dval"},
+			{"amount", "1000"},
+		},
+	}
+	row := rowFromEvent(evt)
+	if len(row) != 9 {
+		t.Fatalf("row len=%d, want 9 (tag_* omitted; tags native inserted)", len(row))
+	}
+	if row[0] != evt.ID || row[1] != evt.PubKey || row[4] != evt.Content || row[5] != evt.Sig {
+		t.Fatalf("scalar columns mismatch: %#v", row[:6])
+	}
+	tagsJSON, ok := row[6].(string)
+	if !ok {
+		t.Fatalf("tags_raw type %T", row[6])
+	}
+	var raw nostr.Tags
+	if err := json.Unmarshal([]byte(tagsJSON), &raw); err != nil {
+		t.Fatalf("tags_raw json: %v", err)
+	}
+	if !reflect.DeepEqual(raw, evt.Tags) {
+		t.Fatalf("tags_raw=%v want %v", raw, evt.Tags)
+	}
+	tags, ok := row[7].([][]string)
+	if !ok {
+		t.Fatalf("tags type %T, want [][]string", row[7])
+	}
+	want := [][]string{
+		{"e", "eid", "wss://r", "reply"},
+		{"p", "pk2"},
+		{"t", "btc"},
+		{"d", "dval"},
+		{"amount", "1000"},
+	}
+	if !reflect.DeepEqual(tags, want) {
+		t.Fatalf("native tags=%v want %v", tags, want)
+	}
+	if row[8] != "eid" {
+		t.Fatalf("reply_to=%v want eid", row[8])
+	}
+
+	empty := rowFromEvent(&nostr.Event{ID: "e"})
+	tags, ok = empty[7].([][]string)
+	if !ok || tags == nil || len(tags) != 0 {
+		t.Fatalf("empty tags = %#v, want non-nil empty [][]string", empty[7])
+	}
+}
+
+func TestNativeTagsRoundTrip(t *testing.T) {
+	in := nostr.Tags{{"e", "id"}, {"t", "x"}}
+	got := nostrTags(nativeTags(in))
+	if !reflect.DeepEqual([][]string(nativeTags(got)), [][]string{{"e", "id"}, {"t", "x"}}) {
+		t.Fatalf("got %#v want %#v", got, in)
+	}
+	if nativeTags(nil) == nil {
+		t.Fatal("nativeTags(nil) must not return nil")
+	}
+	if nostrTags(nil) == nil {
+		t.Fatal("nostrTags(nil) must not return nil")
 	}
 }
 

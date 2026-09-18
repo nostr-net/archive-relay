@@ -11,9 +11,11 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -147,6 +149,9 @@ func TestStoreSaveAndQueryKind1(t *testing.T) {
 	got = drain(ch)
 	if len(got) != 1 || got[0].ID != n1.ID {
 		t.Fatalf("id query got %v", got)
+	}
+	if !reflect.DeepEqual(tagStrings(got[0].Tags), [][]string{{"t", "golang"}, {"t", "nostr"}}) {
+		t.Fatalf("native tags round-trip got %v", got[0].Tags)
 	}
 
 	// Count
@@ -605,4 +610,211 @@ func contents(ev []*nostr.Event) []string {
 		out[i] = fmt.Sprintf("kind=%d id=%s content=%q", e.Kind, e.ID, e.Content)
 	}
 	return out
+}
+
+func tagStrings(tags nostr.Tags) [][]string {
+	return nativeTags(tags)
+}
+
+func TestNativeTagsQueryRoundTrip(t *testing.T) {
+	s, _, teardown := setupStore(t)
+	defer teardown()
+	ctx := context.Background()
+
+	sk := nostr.GeneratePrivateKey()
+	tags := nostr.Tags{
+		{"e", "deadbeef", "wss://relay.example", "reply"},
+		{"p", "pkpkpk"},
+		{"t", "bitcoin"},
+		{"amount", "21000"},
+		{"client", "archive-relay"},
+	}
+	evt := signEvent(t, sk, 1, "native-tags", tags, 0)
+	if err := s.SaveEvent(ctx, evt); err != nil {
+		t.Fatalf("SaveEvent: %v", err)
+	}
+	mustFlush(t, s)
+
+	ch, err := s.QueryEvents(ctx, nostr.Filter{IDs: []string{evt.ID}})
+	if err != nil {
+		t.Fatalf("QueryEvents: %v", err)
+	}
+	got := drain(ch)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(got))
+	}
+	if !reflect.DeepEqual(tagStrings(got[0].Tags), tagStrings(tags)) {
+		t.Fatalf("tags=%v want %v", got[0].Tags, tags)
+	}
+
+	// clickhouse-go Append of [][]string landed as Array(Array(String))
+	var stored [][]string
+	if err := s.ch.QueryRow(ctx, "SELECT tags FROM events_archive WHERE id = ?", evt.ID).Scan(&stored); err != nil {
+		t.Fatalf("select tags: %v", err)
+	}
+	if !reflect.DeepEqual(stored, tagStrings(tags)) {
+		t.Fatalf("stored tags=%v want %v", stored, tags)
+	}
+	// DEFAULT-derived accelerators still work (tag filters + stats).
+	var tagE, tagT []string
+	if err := s.ch.QueryRow(ctx, "SELECT tag_e, tag_t FROM events_archive WHERE id = ?", evt.ID).Scan(&tagE, &tagT); err != nil {
+		t.Fatalf("select accelerators: %v", err)
+	}
+	if !reflect.DeepEqual(tagE, []string{"deadbeef"}) || !reflect.DeepEqual(tagT, []string{"bitcoin"}) {
+		t.Fatalf("tag_e=%v tag_t=%v", tagE, tagT)
+	}
+
+	empty := signEvent(t, sk, 1, "no-tags", nostr.Tags{}, 0)
+	if err := s.SaveEvent(ctx, empty); err != nil {
+		t.Fatal(err)
+	}
+	mustFlush(t, s)
+	ch, err = s.QueryEvents(ctx, nostr.Filter{IDs: []string{empty.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = drain(ch)
+	if len(got) != 1 || len(got[0].Tags) != 0 {
+		t.Fatalf("empty tags: %+v", got)
+	}
+}
+
+func TestEventsAllViewAfterTagsMigration(t *testing.T) {
+	s, _, teardown := setupStore(t)
+	defer teardown()
+	ctx := context.Background()
+
+	sk := nostr.GeneratePrivateKey()
+	evt := signEvent(t, sk, 1, "view-check", nostr.Tags{{"t", "view"}}, 0)
+	if err := s.SaveEvent(ctx, evt); err != nil {
+		t.Fatal(err)
+	}
+	mustFlush(t, s)
+
+	var n uint64
+	if err := s.ch.QueryRow(ctx, "SELECT count() FROM events_all WHERE id = ?", evt.ID).Scan(&n); err != nil {
+		t.Fatalf("events_all did not resolve: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("events_all count=%d", n)
+	}
+	for _, col := range []string{"tags", "tags_raw", "tag_e", "tag_p", "tag_t", "tag_d", "reply_to"} {
+		var c uint64
+		q := `SELECT count() FROM system.columns WHERE database = currentDatabase() AND table IN ('events_permanent','events_archive','events_social') AND name = ?`
+		if err := s.ch.QueryRow(ctx, q, col).Scan(&c); err != nil {
+			t.Fatal(err)
+		}
+		if c != 3 {
+			t.Fatalf("column %s present on %d/3 tiers", col, c)
+		}
+	}
+	var tags [][]string
+	var tagT []string
+	if err := s.ch.QueryRow(ctx, "SELECT tags, tag_t FROM events_all WHERE id = ?", evt.ID).Scan(&tags, &tagT); err != nil {
+		t.Fatalf("events_all column types: %v", err)
+	}
+	if !reflect.DeepEqual(tags, [][]string{{"t", "view"}}) || !reflect.DeepEqual(tagT, []string{"view"}) {
+		t.Fatalf("events_all tags=%v tag_t=%v", tags, tagT)
+	}
+}
+
+func TestTagsBackfillExistingInstall(t *testing.T) {
+	admin, err := clickhouse.Open(&clickhouse.Options{
+		Addr: []string{chAddr}, Auth: clickhouse.Auth{Database: "default"},
+	})
+	if err != nil {
+		t.Fatalf("admin open: %v", err)
+	}
+	ctx := context.Background()
+	if err := admin.Exec(ctx, fmt.Sprintf("DROP DATABASE IF EXISTS %s", testDB)); err != nil {
+		t.Fatalf("drop db: %v", err)
+	}
+	if err := admin.Exec(ctx, fmt.Sprintf("CREATE DATABASE %s", testDB)); err != nil {
+		t.Fatalf("create db: %v", err)
+	}
+	_ = admin.Close()
+
+	conn, err := clickhouse.Open(&clickhouse.Options{
+		Addr: []string{chAddr}, Auth: clickhouse.Auth{Database: testDB, Username: "default"},
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	oldDDL := `
+CREATE TABLE events_%s (
+  id String, pubkey String, created_at UInt32, kind UInt32, content String, sig String,
+  tags_raw String, tag_e Array(String), tag_p Array(String), tag_t Array(String),
+  tag_d String, reply_to String,
+  received_at DateTime64(3) DEFAULT now64(3),
+  version UInt32 MATERIALIZED created_at
+) ENGINE = ReplacingMergeTree(version)
+  PARTITION BY toYYYYMM(toDateTime(created_at))
+  ORDER BY (kind, pubkey, created_at, id)`
+	for _, tier := range activeTiers {
+		if err := conn.Exec(ctx, fmt.Sprintf(oldDDL, tier)); err != nil {
+			t.Fatalf("old schema %s: %v", tier, err)
+		}
+	}
+
+	sk := nostr.GeneratePrivateKey()
+	tags := nostr.Tags{{"e", "aabbccdd", "wss://r", "reply"}, {"t", "golang"}, {"amount", "42"}}
+	evt := signEvent(t, sk, 1, "legacy-row", tags, 0)
+	tagsJSON, err := json.Marshal(evt.Tags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch, err := conn.PrepareBatch(ctx, "INSERT INTO events_archive (id, pubkey, created_at, kind, content, sig, tags_raw, tag_e, tag_p, tag_t, tag_d, reply_to)")
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	if err := batch.Append(evt.ID, evt.PubKey, uint32(evt.CreatedAt), uint32(evt.Kind), evt.Content, evt.Sig, string(tagsJSON), []string{"aabbccdd"}, []string{}, []string{"golang"}, "", "aabbccdd"); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if err := batch.Send(); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	_ = conn.Close()
+
+	cfg := &config.Config{
+		ClickHouse: config.ClickHouse{Addr: chAddr, Database: testDB, Username: "default"},
+		Batch:      config.Batch{MaxSize: 50, MaxAge: 200 * time.Millisecond},
+		Retention:  config.Retention{Archive: "10 YEAR", Social: "1 YEAR"},
+	}
+	s := New(cfg, testLogger())
+	if err := s.Init(); err != nil {
+		t.Fatalf("init over old schema: %v", err)
+	}
+	defer s.Close()
+
+	deadline := time.Now().Add(15 * time.Second)
+	var stored [][]string
+	for time.Now().Before(deadline) {
+		if err := s.ch.QueryRow(ctx, "SELECT tags FROM events_archive WHERE id = ?", evt.ID).Scan(&stored); err != nil {
+			t.Fatalf("select tags: %v", err)
+		}
+		if len(stored) > 0 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !reflect.DeepEqual(stored, tagStrings(tags)) {
+		t.Fatalf("backfill tags=%v want %v", stored, tags)
+	}
+
+	ch, err := s.QueryEvents(ctx, nostr.Filter{IDs: []string{evt.ID}})
+	if err != nil {
+		t.Fatalf("QueryEvents: %v", err)
+	}
+	got := drain(ch)
+	if len(got) != 1 || !reflect.DeepEqual(tagStrings(got[0].Tags), tagStrings(tags)) {
+		t.Fatalf("read path after backfill: %v", got)
+	}
+
+	var n uint64
+	if err := s.ch.QueryRow(ctx, "SELECT count() FROM events_all WHERE id = ?", evt.ID).Scan(&n); err != nil {
+		t.Fatalf("events_all after migration: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("events_all count=%d", n)
+	}
 }

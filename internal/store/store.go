@@ -6,7 +6,6 @@ package store
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -21,8 +20,9 @@ import (
 )
 
 // readColumns is the 7-column SELECT list for QueryEvents. scanEvent must
-// match this order and count (codex #10 / §1.7).
-const readColumns = "id, pubkey, created_at, kind, content, sig, tags_raw"
+// match this order and count (codex #10 / §1.7). Native `tags` replaces
+// tags_raw so the read path does not JSON-decode per row (F6).
+const readColumns = "id, pubkey, created_at, kind, content, sig, tags"
 
 // readAdmissionCap is the in-flight bound for QueryEvents / CountEvents /
 // ReplaceEvent probes. It matches the intended read-pool MaxOpenConns (16).
@@ -448,14 +448,13 @@ func sortDesc(ev []*nostr.Event) {
 // scanEvent reads a QueryEvents row (readColumns order: 7 destinations).
 func scanEvent(rows driver.Rows) (*nostr.Event, error) {
 	var (
-		id, pubkey, content, sig, tagsRaw string
-		createdAt, kind                   uint32
+		id, pubkey, content, sig string
+		createdAt, kind          uint32
+		tags                     [][]string
 	)
-	if err := rows.Scan(&id, &pubkey, &createdAt, &kind, &content, &sig, &tagsRaw); err != nil {
+	if err := rows.Scan(&id, &pubkey, &createdAt, &kind, &content, &sig, &tags); err != nil {
 		return nil, err
 	}
-	tags := nostr.Tags{}
-	_ = json.Unmarshal([]byte(tagsRaw), &tags) // tags_raw is authoritative
 	return &nostr.Event{
 		ID:        id,
 		PubKey:    pubkey,
@@ -463,6 +462,6 @@ func scanEvent(rows driver.Rows) (*nostr.Event, error) {
 		Kind:      int(kind),
 		Content:   content,
 		Sig:       sig,
-		Tags:      tags,
+		Tags:      nostrTags(tags),
 	}, nil
 }
