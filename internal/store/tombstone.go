@@ -25,11 +25,10 @@ type tombstoneWriter struct {
 	conn driver.Conn
 	log  *slog.Logger
 
-	in        chan tombstoneReq
-	stopCh    chan struct{}
-	done      chan struct{}
-	producers sync.RWMutex
-	stopOnce  sync.Once
+	in       chan tombstoneReq
+	stopCh   chan struct{}
+	done     chan struct{}
+	stopOnce sync.Once
 
 	// writer-goroutine-only state
 	lastReload time.Time
@@ -67,10 +66,11 @@ func (w *tombstoneWriter) start() {
 }
 
 // retire bounds the entire enqueue call to five seconds. An error may follow
-// a partially accepted request; callers may safely retry tombstone ids.
+// a partially accepted request; callers may safely retry tombstone ids (a
+// duplicate tombstone insert is harmless). No lock is held across the send:
+// producers self-abort on the closed stopCh, so stop() never has to wait
+// behind a blocked 5s retire (grok review #6).
 func (w *tombstoneWriter) retire(ids []string, reason, deletedBy string) error {
-	w.producers.RLock()
-	defer w.producers.RUnlock()
 	timer := time.NewTimer(5 * time.Second)
 	defer timer.Stop()
 	select {
@@ -146,13 +146,17 @@ func (w *tombstoneWriter) run() {
 		case <-tick.C:
 			flush()
 		case <-w.stopCh:
-			// Join enqueue calls before draining, so no accepted id arrives after
-			// the channel has been observed empty.
-			w.producers.Lock()
-			w.producers.Unlock()
+			// Drain what's queued, flush once, reload once, exit. Producers
+			// abort on the closed stopCh before each push, so nothing new can
+			// START; the 50ms grace sweep below closes the scheduler-interleave
+			// race of a send committing exactly as the drain sees empty.
+			// ponytail: residual risk if a send commits >50ms after drain-empty
+			// — impossible today since blocked sends wake on close; revisit only
+			// if retire ever gains an internal retry loop.
 			shutdownCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 			defer cancel()
 			ctx = shutdownCtx
+			grace := false
 			for {
 				select {
 				case req := <-w.in:
@@ -161,6 +165,13 @@ func (w *tombstoneWriter) run() {
 						flush()
 					}
 				default:
+					if !grace {
+						// one grace sweep: a producer send could commit in the same
+						// scheduler interleave that hit this default
+						grace = true
+						time.Sleep(50 * time.Millisecond)
+						continue
+					}
 					flush()
 					if len(buf) > 0 {
 						w.log.Error("tombstones lost at shutdown: deleted events may reappear", "n", len(buf))

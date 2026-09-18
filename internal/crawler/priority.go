@@ -3,7 +3,6 @@ package crawler
 import (
 	"context"
 	"log/slog"
-	"sync"
 	"time"
 
 	"github.com/nbd-wtf/go-nostr"
@@ -25,9 +24,28 @@ const (
 	// sweep gate — it refreshes every incremental tick, so using it made
 	// the documented periodic sweep dead (plan §1.8 / codex #13).
 	fullSweepAge = 24 * time.Hour
-	// pubkeyWorkers is the bounded parallelism for fetchPubkey per tick.
-	pubkeyWorkers = 4
 )
+
+// relayConn is the go-nostr Relay surface the priority crawler uses. Tests
+// inject a fake via PriorityCrawler.dial.
+type relayConn interface {
+	Connect(ctx context.Context) error
+	Subscribe(ctx context.Context, filters nostr.Filters, opts ...nostr.SubscriptionOption) (*nostr.Subscription, error)
+	Close() error
+}
+
+// relayDialer constructs a (not yet connected) relayConn for url.
+// Production uses newUpstreamRelay (AssumeValid=true before Connect).
+type relayDialer func(ctx context.Context, url string) relayConn
+
+// pubkeyJob is one pubkey's fetch decision for a tick (since + whether this
+// attempt is a full-history sweep). Computed once up front so failover across
+// relays does not re-read crawl_state.
+type pubkeyJob struct {
+	pubkey    string
+	since     *nostr.Timestamp
+	fullSweep bool
+}
 
 // PriorityCrawler fetches the history of a configured set of pubkeys from a
 // dedicated relay list (separate from the firehose -sources), ensuring their
@@ -45,6 +63,7 @@ type PriorityCrawler struct {
 	ctrl     *control.DB
 	interval time.Duration
 	log      *slog.Logger
+	dial     relayDialer
 }
 
 // NewPriority constructs a PriorityCrawler. pubkeys/relays must be non-empty for
@@ -78,37 +97,48 @@ func (p *PriorityCrawler) Run(ctx context.Context) {
 	}
 }
 
+// tick visits each relay once: one websocket (AssumeValid set before Connect),
+// then every still-incomplete pubkey as a sequential subscription on that conn
+// (per-sub fetchTimeout). Sequential-per-conn is intentional — fetchOn's ingest
+// loop serializes events from one subscription, so overlapping subs on the same
+// conn would not increase throughput. Pubkeys the relay does not complete
+// (connect/subscribe/timeout/incomplete EOSE) remain for the next URL,
+// preserving per-pubkey failover. The conn is closed before moving on.
 func (p *PriorityCrawler) tick(ctx context.Context) {
 	kinds := store.InScopeKinds()
-	sem := make(chan struct{}, pubkeyWorkers)
-	var wg sync.WaitGroup
-loop:
+	remaining := make([]pubkeyJob, 0, len(p.pubkeys))
 	for _, pk := range p.pubkeys {
-		select {
-		case <-ctx.Done():
-			break loop
-		case sem <- struct{}{}:
+		if ctx.Err() != nil {
+			return
 		}
-		wg.Add(1)
-		go func(pk string) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			p.fetchPubkey(ctx, pk, kinds)
-		}(pk)
+		since, full := p.decideSince(ctx, pk)
+		remaining = append(remaining, pubkeyJob{pubkey: pk, since: since, fullSweep: full})
 	}
-	wg.Wait()
+	for _, url := range p.relays {
+		if ctx.Err() != nil || len(remaining) == 0 {
+			break
+		}
+		remaining = p.fetchRelay(ctx, url, remaining, kinds)
+	}
+	for _, job := range remaining {
+		p.log.With("pubkey", job.pubkey).Warn("no relay served this pubkey", "relays", p.relays)
+	}
 }
 
-// fetchPubkey pulls one pubkey's events from the first relay that serves it,
-// then records last_fetched (and last_full_sweep on a full sweep). Trying
-// relays in order lets a pubkey be completed from one relay even if another
-// is down.
-func (p *PriorityCrawler) fetchPubkey(ctx context.Context, pubkey string, kinds []int) {
-	log := p.log.With("pubkey", pubkey)
+func (p *PriorityCrawler) dialRelay(ctx context.Context, url string) relayConn {
+	if p.dial != nil {
+		return p.dial(ctx, url)
+	}
+	return newUpstreamRelay(ctx, url)
+}
 
-	// Full sweep when the pubkey has never been crawled (last_fetched==0) or
-	// last_full_sweep is older than fullSweepAge. Incremental ticks only
-	// refresh last_fetched, so sweeps must not key off it.
+// decideSince returns the subscription Since (nil = full history) and whether
+// this tick is a full-history sweep. Full sweep when the pubkey has never been
+// crawled (last_fetched==0), last_full_sweep is older than fullSweepAge, or
+// either crawl_state lookup failed. Incremental ticks only refresh
+// last_fetched, so sweeps must not key off it.
+func (p *PriorityCrawler) decideSince(ctx context.Context, pubkey string) (since *nostr.Timestamp, fullSweep bool) {
+	log := p.log.With("pubkey", pubkey)
 	last, err := p.ctrl.LastFetched(ctx, pubkey)
 	if err != nil {
 		log.Warn("last_fetched lookup failed; doing full fetch", "err", err)
@@ -117,56 +147,58 @@ func (p *PriorityCrawler) fetchPubkey(ctx context.Context, pubkey string, kinds 
 	if serr != nil {
 		log.Warn("last_full_sweep lookup failed; doing full fetch", "err", serr)
 	}
-	fullSweep := err != nil || serr != nil || last == 0 || time.Since(time.Unix(swept, 0)) >= fullSweepAge
-
-	var since *nostr.Timestamp
+	fullSweep = err != nil || serr != nil || last == 0 || time.Since(time.Unix(swept, 0)) >= fullSweepAge
 	if !fullSweep {
 		if ts := last - int64(fetchOverlap/time.Second); ts > 0 {
 			t := nostr.Timestamp(ts)
 			since = &t
 		}
 	}
-
-	for _, url := range p.relays {
-		if ctx.Err() != nil {
-			return
-		}
-		if p.fetchFrom(ctx, url, pubkey, kinds, since, log) {
-			_ = p.ctrl.MarkFetched(ctx, pubkey)
-			if fullSweep {
-				_ = p.ctrl.MarkSwept(ctx, pubkey)
-			}
-			return
-		}
-	}
-	log.Warn("no relay served this pubkey", "relays", p.relays)
+	return since, fullSweep
 }
 
-// fetchFrom connects to one relay, subscribes to the pubkey's in-scope events
-// (bounded by `since` on incremental ticks), and ingests everything until EOSE.
-// The fetch is bounded by fetchTimeout; a stalled relay reports false so the
-// next relay is tried, as does a subscription closed before EOSE or a dropped
-// events channel — anything short of a clean EOSE must not advance
-// last_fetched past events that were never fetched. One conn per relay per
-// tick (created here, closed on return).
-func (p *PriorityCrawler) fetchFrom(parent context.Context, url, pubkey string,
+func (p *PriorityCrawler) fetchRelay(ctx context.Context, url string, remaining []pubkeyJob, kinds []int) []pubkeyJob {
+	relay := p.dialRelay(ctx, url)
+	if err := relay.Connect(ctx); err != nil {
+		p.log.Warn("connect failed", "relay", url, "err", err)
+		_ = relay.Close()
+		return remaining
+	}
+	defer relay.Close()
+
+	var incomplete []pubkeyJob
+	for i, job := range remaining {
+		if ctx.Err() != nil {
+			return append(incomplete, remaining[i:]...)
+		}
+		log := p.log.With("pubkey", job.pubkey)
+		if p.fetchOn(ctx, relay, url, job.pubkey, kinds, job.since, log) {
+			_ = p.ctrl.MarkFetched(ctx, job.pubkey)
+			if job.fullSweep {
+				_ = p.ctrl.MarkSwept(ctx, job.pubkey)
+			}
+			continue
+		}
+		incomplete = append(incomplete, job)
+	}
+	return incomplete
+}
+
+// fetchOn subscribes to one pubkey on an already-connected relay and ingests
+// until EOSE. Bounded by fetchTimeout; a stalled/closed subscription reports
+// false so the next relay is tried. Anything short of a clean EOSE must not
+// advance last_fetched past events that were never fetched.
+func (p *PriorityCrawler) fetchOn(parent context.Context, relay relayConn, url, pubkey string,
 	kinds []int, since *nostr.Timestamp, log *slog.Logger) bool {
 	ctx, cancel := context.WithTimeout(parent, fetchTimeout)
 	defer cancel()
-
-	relay := newUpstreamRelay(ctx, url)
-	if err := relay.Connect(ctx); err != nil {
-		log.Warn("connect failed", "relay", url, "err", err)
-		return false // try the next relay
-	}
-	defer relay.Close()
 
 	sub, err := relay.Subscribe(ctx, nostr.Filters{{
 		Authors: []string{pubkey}, Kinds: kinds, Since: since,
 	}})
 	if err != nil {
 		log.Warn("subscribe failed", "relay", url, "err", err)
-		return false // try the next relay
+		return false
 	}
 
 	ingested, skipped := 0, 0
@@ -174,22 +206,19 @@ func (p *PriorityCrawler) fetchFrom(parent context.Context, url, pubkey string,
 		select {
 		case <-ctx.Done():
 			if parent.Err() == nil {
-				// fetchTimeout hit, not shutdown — try the next relay
 				log.Warn("fetch timed out", "relay", url, "ingested", ingested)
 			}
-			// shutdown or timeout: incomplete either way — only a clean EOSE
-			// is "done" (the fetchPubkey loop's ctx.Err() guard aborts on shutdown).
 			return false
 		case <-sub.EndOfStoredEvents:
 			log.Info("priority crawl done", "relay", url, "ingested", ingested, "skipped", skipped)
 			return true
 		case reason := <-sub.ClosedReason:
 			log.Warn("subscription closed before EOSE", "relay", url, "reason", reason)
-			return false // incomplete — try the next relay
+			return false
 		case ev, ok := <-sub.Events:
 			if !ok {
 				log.Warn("events channel closed before EOSE", "relay", url, "ingested", ingested)
-				return false // incomplete — try the next relay
+				return false
 			}
 			if ingest(ctx, p.store, p.dedup, p.log, ev) {
 				ingested++

@@ -302,3 +302,36 @@ func TestPruneSeenByRowidExactCap(t *testing.T) {
 		t.Errorf("remaining %d, want exactly cap=%d", len(ids), cap)
 	}
 }
+
+func TestPruneSeenByRowidChunked(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	const (
+		rows  = 120
+		cap   = 10
+		chunk = 50
+	)
+	old := pruneSeenChunk
+	pruneSeenChunk = chunk
+	t.Cleanup(func() { pruneSeenChunk = old })
+
+	for i := 0; i < rows; i++ {
+		if _, err := db.MarkSeen(ctx, fmt.Sprintf("id-%d", i), int64(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	n, err := db.PruneSeenByRowid(ctx, cap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != rows-cap {
+		t.Errorf("deleted %d, want %d", n, rows-cap)
+	}
+	ids, err := db.LoadRecentSeen(ctx, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != cap {
+		t.Errorf("remaining %d, want exactly cap=%d", len(ids), cap)
+	}
+}

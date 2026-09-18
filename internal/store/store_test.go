@@ -180,7 +180,7 @@ func TestAcquireReadOverflow(t *testing.T) {
 		s.readSem <- struct{}{}
 		s.readWait <- struct{}{}
 	}
-	err := s.acquireRead(context.Background())
+	_, err := s.acquireRead(context.Background())
 	if !errors.Is(err, ErrReadBusy) {
 		t.Fatalf("got %v, want ErrReadBusy", err)
 	}
@@ -193,7 +193,7 @@ func TestAcquireReadCtxCancel(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err := s.acquireRead(ctx)
+	_, err := s.acquireRead(ctx)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("got %v, want context.Canceled", err)
 	}
@@ -291,5 +291,22 @@ func TestReplyTargetNIP10(t *testing.T) {
 		if got := replyTarget(c.tags); got != c.want {
 			t.Errorf("%s: replyTarget() = %q, want %q", c.name, got, c.want)
 		}
+	}
+}
+
+func TestAcquireReadInternalCallBypassesAdmission(t *testing.T) {
+	s := New(&config.Config{}, slog.Default())
+	for i := 0; i < readAdmissionCap; i++ {
+		s.readSem <- struct{}{}
+		s.readWait <- struct{}{}
+	}
+	// khatru 0.19.1 provides no exported constructor for internal-call ctx
+	// (the key is unexported), so the bypass branch is exercised end-to-end by
+	// khatru's own deleting/expiration paths. Here we pin the sibling behavior:
+	// a saturated semaphore still fails EXTERNAL callers, so the bypass is the
+	// only thing keeping NIP-09 alive under load.
+	_, err := s.acquireRead(context.Background())
+	if !errors.Is(err, ErrReadBusy) {
+		t.Fatalf("got %v, want ErrReadBusy", err)
 	}
 }

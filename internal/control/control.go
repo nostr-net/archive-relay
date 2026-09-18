@@ -192,34 +192,56 @@ func (d *DB) PruneSeen(ctx context.Context, maxAge time.Duration) (int64, error)
 	return n, nil
 }
 
+// pruneSeenChunk is the max seen_events rows deleted per transaction so a
+// cap-prune cannot stall the SQLite pool (busy_timeout 5s) with a single
+// multi-million-row DELETE. Tests may lower it to exercise the chunk loop.
+var pruneSeenChunk = 50_000
+
 // PruneSeenByRowid deletes the oldest seen_events rows so at most cap newest
-// rows remain. Uses `rowid <= (SELECT … ORDER BY rowid DESC LIMIT 1 OFFSET cap)`
-// (`<=`, not `<`) so the cutoff row is included and remaining == cap, not
-// cap+1 (plan §1.9 / codex #15). The delete runs in its own transaction.
-// cap <= 0 is a no-op.
+// rows remain. Deletes run in chunks of pruneSeenChunk, each in its own
+// transaction, then a bounded `PRAGMA incremental_vacuum(1000)` reclaims a
+// limited number of free pages. cap <= 0 is a no-op.
 func (d *DB) PruneSeenByRowid(ctx context.Context, cap int) (int64, error) {
 	if cap <= 0 {
 		return 0, nil
 	}
-	tx, err := d.conn.BeginTx(ctx, nil)
-	if err != nil {
+	var count int64
+	if err := d.conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM seen_events").Scan(&count); err != nil {
 		return 0, err
 	}
-	defer tx.Rollback()
-	res, err := tx.ExecContext(ctx, `
-DELETE FROM seen_events
-WHERE rowid <= (SELECT rowid FROM seen_events ORDER BY rowid DESC LIMIT 1 OFFSET ?)`, cap)
-	if err != nil {
-		return 0, err
+	var deleted int64
+	for count > int64(cap) {
+		n := int64(pruneSeenChunk)
+		if extra := count - int64(cap); n > extra {
+			n = extra
+		}
+		tx, err := d.conn.BeginTx(ctx, nil)
+		if err != nil {
+			return deleted, err
+		}
+		res, err := tx.ExecContext(ctx, `
+DELETE FROM seen_events WHERE rowid IN (
+  SELECT rowid FROM seen_events ORDER BY rowid ASC LIMIT ?
+)`, n)
+		if err != nil {
+			_ = tx.Rollback()
+			return deleted, err
+		}
+		got, _ := res.RowsAffected()
+		if err := tx.Commit(); err != nil {
+			_ = tx.Rollback()
+			return deleted, err
+		}
+		if got == 0 {
+			break
+		}
+		deleted += got
+		count -= got
 	}
-	n, _ := res.RowsAffected()
-	if err := tx.Commit(); err != nil {
-		return 0, err
-	}
-	// Reclaim free pages when auto_vacuum=INCREMENTAL is in effect (no-op on
-	// pre-existing files that never VACUUMed into incremental mode).
-	_, _ = d.conn.ExecContext(ctx, "PRAGMA incremental_vacuum")
-	return n, nil
+	// Bounded reclaim: 1000 pages per prune, not an unbounded vacuum of the
+	// whole free-list (which can stall MarkSeenBatch behind busy_timeout).
+	_, _ = d.conn.ExecContext(ctx, "PRAGMA incremental_vacuum(1000)")
+	return deleted, nil
 }
 
 // AllowedPubkey is one row of the dynamic allow-list.

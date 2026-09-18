@@ -71,7 +71,8 @@ CREATE TABLE IF NOT EXISTS events_%[1]s (%[2]s
 }
 
 // eventsViewDDL builds the UNION ALL view over all tiers (used by stats and
-// ad-hoc queries; the relay read path queries tiers directly with FINAL).
+// ad-hoc queries; the relay read path queries tiers directly with
+// LIMIT 1 BY collapse — FINAL survives only in CountEvents).
 func eventsViewDDL() string {
 	return `
 CREATE OR REPLACE VIEW events_all AS
@@ -144,7 +145,7 @@ func (s *Store) execParts(ctx context.Context, q string) error {
 		if part == "" {
 			continue
 		}
-		if err := s.ch.Exec(ctx, part); err != nil {
+		if err := s.wch.Exec(ctx, part); err != nil {
 			return fmt.Errorf("schema init failed on %q: %w", truncate(part, 80), err)
 		}
 	}
@@ -171,6 +172,15 @@ func (s *Store) initSchema(ctx context.Context) error {
 	}
 	for _, tier := range activeTiers {
 		table := "events_" + tier
+		// Was idx_pubkey just created (fresh/migrated install)? Only then queue
+		// a MATERIALIZE mutation — running it every startup would re-queue a
+		// mutation on all parts each boot (grok review #7).
+		var haveIdx uint64
+		if err := s.wch.QueryRow(ctx,
+			"SELECT count() FROM system.data_skipping_indices WHERE database = currentDatabase() AND table = ? AND name = 'idx_pubkey'",
+			table).Scan(&haveIdx); err != nil {
+			return fmt.Errorf("index introspection failed for %q: %w", table, err)
+		}
 		for _, ddl := range []string{
 			"ALTER TABLE " + table + " ADD COLUMN IF NOT EXISTS tags Array(Array(String)) DEFAULT " + tagsDefaultExpr + " AFTER tags_raw",
 			"ALTER TABLE " + table + " MODIFY COLUMN tags Array(Array(String)) DEFAULT " + tagsDefaultExpr,
@@ -181,20 +191,22 @@ func (s *Store) initSchema(ctx context.Context) error {
 			"ALTER TABLE " + table + " ADD INDEX IF NOT EXISTS idx_pubkey pubkey TYPE bloom_filter(0.01) GRANULARITY 4",
 			"ALTER TABLE " + table + " DROP INDEX IF EXISTS idx_content",
 		} {
-			if err := s.ch.Exec(ctx, ddl); err != nil {
+			if err := s.wch.Exec(ctx, ddl); err != nil {
 				return fmt.Errorf("schema column/index migration failed on %q: %w", truncate(ddl, 80), err)
 			}
 		}
-		if err := s.ch.Exec(ctx, "ALTER TABLE "+table+" MATERIALIZE INDEX idx_pubkey"); err != nil {
-			if strings.Contains(strings.ToLower(err.Error()), "already exists") {
-				s.log.Info("pubkey index materialization already exists", "table", table, "err", err)
-			} else {
-				s.log.Warn("pubkey index materialization failed; will retry at next startup", "table", table, "err", err)
+		if haveIdx == 0 {
+			if err := s.wch.Exec(ctx, "ALTER TABLE "+table+" MATERIALIZE INDEX idx_pubkey"); err != nil {
+				if strings.Contains(strings.ToLower(err.Error()), "already exists") {
+					s.log.Info("pubkey index materialization already exists", "table", table, "err", err)
+				} else {
+					s.log.Warn("pubkey index materialization failed; will retry at next startup", "table", table, "err", err)
+				}
 			}
 		}
 		// Mutation is queued (mutations_sync=0); do not wait for is_done.
 		backfill := "ALTER TABLE " + table + " UPDATE tags = JSONExtract(tags_raw, 'Array(Array(String))') WHERE empty(tags)"
-		if err := s.ch.Exec(ctx, backfill); err != nil {
+		if err := s.wch.Exec(ctx, backfill); err != nil {
 			s.log.Warn("tags backfill mutation failed; will retry at next startup", "table", table, "err", err)
 		} else {
 			s.log.Info("tags backfill mutation submitted", "table", table)
@@ -205,7 +217,7 @@ func (s *Store) initSchema(ctx context.Context) error {
 		return err
 	}
 	var found uint8
-	if err := s.ch.QueryRow(ctx, "SELECT dictHas('tombstone_dict', '0000000000000000000000000000000000000000000000000000000000000000')").Scan(&found); err != nil {
+	if err := s.wch.QueryRow(ctx, "SELECT dictHas('tombstone_dict', '0000000000000000000000000000000000000000000000000000000000000000')").Scan(&found); err != nil {
 		return fmt.Errorf("tombstone dictionary startup sanity probe failed: %w", err)
 	}
 

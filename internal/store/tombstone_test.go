@@ -49,15 +49,20 @@ func (c *tombTestConn) Exec(_ context.Context, q string, _ ...any) error {
 	}
 	return nil
 }
-func (c *tombTestConn) QueryRow(context.Context, string, ...any) driver.Row {
+func (c *tombTestConn) QueryRow(ctx context.Context, q string, args ...any) driver.Row {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	found := uint8(1)
-	if c.probeMisses > 0 {
-		c.probeMisses--
-		found = 0
+	// the schema index-introspection query is NOT the dict sanity probe — it
+	// must succeed even when the probe is set to fail
+	if !strings.Contains(q, "data_skipping_indices") {
+		if c.probeMisses > 0 {
+			c.probeMisses--
+			found = 0
+		}
+		return tombTestRow{found: found, err: c.probeErr}
 	}
-	return tombTestRow{found: found, err: c.probeErr}
+	return tombTestRow{found: found}
 }
 
 type tombTestRow struct {
@@ -70,7 +75,14 @@ func (r tombTestRow) Scan(dest ...any) error {
 	if r.err != nil {
 		return r.err
 	}
-	*dest[0].(*uint8) = r.found
+	switch d := dest[0].(type) {
+	case *uint8:
+		*d = uint8(r.found)
+	case *uint64:
+		*d = uint64(r.found)
+	default:
+		return fmt.Errorf("tombTestRow.Scan: unsupported dest %T", dest[0])
+	}
 	return nil
 }
 
@@ -219,7 +231,7 @@ func TestTombstoneRetireTimeout(t *testing.T) {
 }
 func TestSchemaSanityProbeAndMutationFailure(t *testing.T) {
 	c := &tombTestConn{execErr: errors.New("transient mutation error")}
-	s := &Store{ch: c, cfg: &config.Config{}, log: tombTestLogger()}
+	s := &Store{wch: c, cfg: &config.Config{}, log: tombTestLogger()}
 	if err := s.initSchema(context.Background()); err != nil {
 		t.Fatalf("mutation failure prevented startup: %v", err)
 	}

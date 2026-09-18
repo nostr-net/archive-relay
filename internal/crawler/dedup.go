@@ -235,9 +235,15 @@ func (d *Dedup) OnFlushed(events []*nostr.Event) {
 	}
 }
 
+// writerDrainTimeout is the total budget for persisting queued seen_events
+// batches on writer shutdown (StopWriter or ctx cancel). Remaining batches
+// after this deadline are dropped.
+const writerDrainTimeout = 10 * time.Second
+
 // StartWriter starts the goroutine that drains the durable seen_events queue.
 // Call once from main after Warm. The loop exits on ctx cancel or StopWriter;
-// remaining queued batches are discarded (re-ingest is the safety net).
+// remaining queued batches are persisted (bounded by writerDrainTimeout)
+// before exit so a graceful shutdown does not drop the final store flush.
 func (d *Dedup) StartWriter(ctx context.Context) {
 	d.writerMu.Lock()
 	defer d.writerMu.Unlock()
@@ -255,10 +261,10 @@ func (d *Dedup) writeLoop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			d.discardQueued()
+			d.drainQueued(writerDrainTimeout)
 			return
 		case <-d.stopWriter:
-			d.discardQueued()
+			d.drainQueued(writerDrainTimeout)
 			return
 		case batch := <-d.writeQ:
 			if err := d.ctrl.MarkSeenBatch(context.Background(), batch); err != nil && d.log != nil {
@@ -268,18 +274,55 @@ func (d *Dedup) writeLoop(ctx context.Context) {
 	}
 }
 
-func (d *Dedup) discardQueued() {
+// drainQueued persists every queued batch with a shared deadline. A batch is
+// discarded only on write error or timeout (Warn + droppedWrites). On
+// deadline, any still-queued batches are dropped too.
+func (d *Dedup) drainQueued(timeout time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
 	for {
 		select {
-		case <-d.writeQ:
+		case batch := <-d.writeQ:
+			if err := ctx.Err(); err != nil {
+				d.dropDrainBatch(batch, err)
+				d.dropRemaining(err)
+				return
+			}
+			if err := d.ctrl.MarkSeenBatch(ctx, batch); err != nil {
+				d.dropDrainBatch(batch, err)
+				if ctx.Err() != nil {
+					d.dropRemaining(ctx.Err())
+					return
+				}
+			}
 		default:
 			return
 		}
 	}
 }
 
-// StopWriter signals the writer to drain+discard the queue and waits for it to
-// exit. Safe to call if StartWriter was never invoked. Call before cdb.Close.
+func (d *Dedup) dropDrainBatch(batch []control.SeenRef, err error) {
+	n := d.droppedWrites.Add(1)
+	if d.log != nil {
+		d.log.Warn("seen_events drain dropping durable batch",
+			"n", len(batch), "droppedBatches", n, "err", err)
+	}
+}
+
+func (d *Dedup) dropRemaining(err error) {
+	for {
+		select {
+		case batch := <-d.writeQ:
+			d.dropDrainBatch(batch, err)
+		default:
+			return
+		}
+	}
+}
+
+// StopWriter signals the writer to drain+persist the queue (bounded deadline)
+// and waits for it to exit. Safe to call if StartWriter was never invoked.
+// Call before cdb.Close.
 func (d *Dedup) StopWriter() {
 	d.writerMu.Lock()
 	defer d.writerMu.Unlock()

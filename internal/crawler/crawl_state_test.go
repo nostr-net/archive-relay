@@ -128,6 +128,31 @@ func TestIngestDropsOutOfScopeKindBeforeVerify(t *testing.T) {
 	if ok || len(saver.saved) != 0 {
 		t.Error("out-of-scope event must be dropped without save")
 	}
+	if d.Seen(ev.ID) {
+		t.Error("out-of-scope event must not stay marked seen")
+	}
+}
+
+func TestIngestDropsInvalidHexID(t *testing.T) {
+	d, _ := testDedup(t)
+	saver := &fakeStore{}
+	ev := matchingEvent()
+	ev.ID = "not-hex"
+	ok := ingestStep(context.Background(), saver, d, testLogger(), ev, func(e *nostr.Event) (idOK, sigOK bool) {
+		return e.CheckID(), true
+	})
+	if ok {
+		t.Error("invalid-hex id must be dropped")
+	}
+	if len(saver.saved) != 0 {
+		t.Errorf("SaveEvent called %d times, want 0", len(saver.saved))
+	}
+	if d.DroppedBadID() != 1 {
+		t.Errorf("DroppedBadID = %d, want 1", d.DroppedBadID())
+	}
+	if d.Seen(ev.ID) {
+		t.Error("invalid-hex id must not poison the seen map")
+	}
 }
 
 func TestIngestUnmarkOnBatchFull(t *testing.T) {
@@ -148,5 +173,130 @@ func TestIngestUnmarkOnBatchFull(t *testing.T) {
 func TestFetchOverlapIsTwoHours(t *testing.T) {
 	if fetchOverlap != 2*time.Hour {
 		t.Errorf("fetchOverlap = %s, want 2h", fetchOverlap)
+	}
+}
+
+func TestFullSweepAgeIs24Hours(t *testing.T) {
+	if fullSweepAge != 24*time.Hour {
+		t.Errorf("fullSweepAge = %s, want 24h", fullSweepAge)
+	}
+}
+
+func testPriority(t *testing.T, pubkeys, relays []string) *PriorityCrawler {
+	t.Helper()
+	d, db := testDedup(t)
+	return NewPriority(pubkeys, relays, nil, d, db, time.Minute, testLogger())
+}
+
+func TestDecideSinceFullSweepWhenNeverFetched(t *testing.T) {
+	p := testPriority(t, nil, nil)
+	since, full := p.decideSince(context.Background(), "pk")
+	if !full {
+		t.Error("want full sweep for unknown pubkey")
+	}
+	if since != nil {
+		t.Errorf("since=%v, want nil", since)
+	}
+}
+
+func TestDecideSinceFullSweepWhenNeverSwept(t *testing.T) {
+	p := testPriority(t, nil, nil)
+	ctx := context.Background()
+	if err := p.ctrl.MarkFetched(ctx, "pk"); err != nil {
+		t.Fatal(err)
+	}
+	since, full := p.decideSince(ctx, "pk")
+	if !full {
+		t.Error("want full sweep when last_full_sweep is unset")
+	}
+	if since != nil {
+		t.Errorf("since=%v, want nil", since)
+	}
+}
+
+func TestDecideSinceIncrementalAfterRecentSweep(t *testing.T) {
+	p := testPriority(t, nil, nil)
+	ctx := context.Background()
+	if err := p.ctrl.MarkFetched(ctx, "pk"); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.ctrl.MarkSwept(ctx, "pk"); err != nil {
+		t.Fatal(err)
+	}
+	last, err := p.ctrl.LastFetched(ctx, "pk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	since, full := p.decideSince(ctx, "pk")
+	if full {
+		t.Error("want incremental after recent sweep")
+	}
+	if since == nil {
+		t.Fatal("since is nil")
+	}
+	want := nostr.Timestamp(last - int64(fetchOverlap/time.Second))
+	if *since != want {
+		t.Errorf("since=%d, want last-overlap=%d", *since, want)
+	}
+}
+
+// eoseRelay is a fake relayConn that Connects, immediately EOSEs on Subscribe,
+// and records call counts. Used to assert one conn per relay per tick.
+type eoseRelay struct {
+	connects   *int
+	subscribes *int
+	closes     *int
+}
+
+func (f *eoseRelay) Connect(context.Context) error {
+	*f.connects++
+	return nil
+}
+
+func (f *eoseRelay) Subscribe(context.Context, nostr.Filters, ...nostr.SubscriptionOption) (*nostr.Subscription, error) {
+	*f.subscribes++
+	eose := make(chan struct{})
+	close(eose)
+	return &nostr.Subscription{
+		Events:            make(chan *nostr.Event),
+		EndOfStoredEvents: eose,
+		ClosedReason:      make(chan string),
+	}, nil
+}
+
+func (f *eoseRelay) Close() error {
+	*f.closes++
+	return nil
+}
+
+func TestTickOneConnPerRelayWhenFirstServesAll(t *testing.T) {
+	p := testPriority(t, []string{"pk1", "pk2"}, []string{"wss://relay-a.example", "wss://relay-b.example"})
+	var connects, subscribes, closes int
+	p.dial = func(_ context.Context, url string) relayConn {
+		if url != p.relays[0] {
+			t.Errorf("dialed %s; first relay should serve all pubkeys", url)
+		}
+		return &eoseRelay{connects: &connects, subscribes: &subscribes, closes: &closes}
+	}
+	p.tick(context.Background())
+	if connects != 1 {
+		t.Errorf("connects = %d, want 1 (one conn per relay per tick)", connects)
+	}
+	if subscribes != 2 {
+		t.Errorf("subscribes = %d, want 2 (one sub per pubkey on the shared conn)", subscribes)
+	}
+	if closes != 1 {
+		t.Errorf("closes = %d, want 1 (conn closed before moving on)", closes)
+	}
+	ctx := context.Background()
+	for _, pk := range []string{"pk1", "pk2"} {
+		fetched, err := p.ctrl.LastFetched(ctx, pk)
+		if err != nil || fetched == 0 {
+			t.Errorf("pubkey %s last_fetched=%d err=%v, want marked", pk, fetched, err)
+		}
+		swept, err := p.ctrl.LastSwept(ctx, pk)
+		if err != nil || swept == 0 {
+			t.Errorf("pubkey %s last_swept=%d err=%v, want marked (full sweep)", pk, swept, err)
+		}
 	}
 }

@@ -14,6 +14,7 @@ import (
 
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
+	"github.com/fiatjaf/khatru"
 	"github.com/nbd-wtf/go-nostr"
 
 	"github.com/nostr-net/archive-relay/internal/config"
@@ -35,7 +36,8 @@ var ErrReadBusy = errors.New("read admission full")
 // Store implements eventstore.Store (Init/Close/QueryEvents/SaveEvent/
 // DeleteEvent/ReplaceEvent) plus Counter (CountEvents) over ClickHouse.
 type Store struct {
-	ch    driver.Conn
+	wch   driver.Conn // write pool: batchers, tombstones, DDL
+	sch   driver.Conn // stats pool: snapshot refresh jobs + API reads
 	cfg   *config.Config
 	log   *slog.Logger
 	tiers map[string]*batcher // keyed by tier name
@@ -44,10 +46,21 @@ type Store struct {
 	// readSem is the shared query admission semaphore (cap 16 = read pool
 	// bound). QueryEvents, CountEvents, and ReplaceEvent's slim probe all
 	// share it. ReplaceEvent is invoked from khatru's SaveEvent path, not
-	// from inside QueryEvents, so sharing cannot deadlock.
+	// from inside QueryEvents, so sharing cannot deadlock. khatru internal
+	// calls (NIP-09 delete lookups) bypass admission — a hide must never be
+	// silently dropped because client REQs saturated the semaphore.
 	readSem  chan struct{}
 	readWait chan struct{} // bounded waiters (same cap); overflow → ErrReadBusy
+
+	ch driver.Conn // read pool: QueryEvents / CountEvents / probe
 }
+
+// Pool sizes per plan §1.5 (F12/M11): write ~4 / read ~16 / stats ~2.
+const (
+	poolWriteConns = 4
+	poolReadConns  = 16
+	poolStatsConns = 2
+)
 
 // New constructs an unopened Store. Call Init() to connect + create schema.
 func New(cfg *config.Config, log *slog.Logger) *Store {
@@ -59,8 +72,50 @@ func New(cfg *config.Config, log *slog.Logger) *Store {
 	}
 }
 
-// Init connects to ClickHouse, creates the schema, and starts the batchers.
+// Init connects to ClickHouse (three pools: write/read/stats — §1.5), creates
+// the schema, and starts the batchers.
 func (s *Store) Init() error {
+	wch, err := s.openConn(poolWriteConns)
+	if err != nil {
+		return err
+	}
+	s.wch = wch
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := s.initSchema(ctx); err != nil {
+		return err
+	}
+
+	// tombstone writer: single goroutine owning all tombstone inserts +
+	// bounded dictionary reloads (§1.3).
+	s.tw = newTombstoneWriter(wch, s.log.With("worker", "tombstone"))
+	s.tw.start()
+
+	// start one batcher per active tier
+	s.tiers = make(map[string]*batcher, len(activeTiers))
+	for _, t := range activeTiers {
+		b := newBatcher(wch, t, s.cfg.Batch.MaxSize, s.cfg.Batch.MaxAge, s.log.With("tier", t))
+		b.start()
+		s.tiers[t] = b
+	}
+
+	// read + stats pools; failure aborts Init (Close cleans up what opened).
+	s.ch, err = s.openConn(poolReadConns)
+	if err != nil {
+		return err
+	}
+	s.sch, err = s.openConn(poolStatsConns)
+	if err != nil {
+		return err
+	}
+	s.log.Info("store initialized", "tiers", activeTiers,
+		"pools", fmt.Sprintf("write=%d read=%d stats=%d", poolWriteConns, poolReadConns, poolStatsConns))
+	return nil
+}
+
+// openConn opens one bounded pool connection.
+func (s *Store) openConn(maxOpen int) (driver.Conn, error) {
 	opts := &clickhouse.Options{
 		Addr: []string{s.cfg.ClickHouse.Addr},
 		Auth: clickhouse.Auth{
@@ -68,39 +123,21 @@ func (s *Store) Init() error {
 			Username: s.cfg.ClickHouse.Username,
 			Password: s.cfg.ClickHouse.Password,
 		},
-		DialTimeout: 5 * time.Second,
-		Settings:    clickhouse.Settings{"max_execution_time": 120},
+		DialTimeout:  5 * time.Second,
+		MaxOpenConns: maxOpen,
+		MaxIdleConns: maxOpen,
+		Settings:     clickhouse.Settings{"max_execution_time": 120},
 	}
 	conn, err := clickhouse.Open(opts)
 	if err != nil {
-		return fmt.Errorf("clickhouse open: %w", err)
+		return nil, fmt.Errorf("clickhouse open: %w", err)
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := conn.Ping(ctx); err != nil {
-		return fmt.Errorf("clickhouse ping %s: %w", s.cfg.ClickHouse.Addr, err)
+	pctx, pcancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer pcancel()
+	if err := conn.Ping(pctx); err != nil {
+		return nil, fmt.Errorf("clickhouse ping %s: %w", s.cfg.ClickHouse.Addr, err)
 	}
-	s.ch = conn
-
-	if err := s.initSchema(ctx); err != nil {
-		return err
-	}
-
-	// tombstone writer: single goroutine owning all tombstone inserts +
-	// bounded dictionary reloads (§1.3).
-	s.tw = newTombstoneWriter(conn, s.log.With("worker", "tombstone"))
-	s.tw.start()
-
-	// start one batcher per active tier
-	s.tiers = make(map[string]*batcher, len(activeTiers))
-	for _, t := range activeTiers {
-		b := newBatcher(conn, t, s.cfg.Batch.MaxSize, s.cfg.Batch.MaxAge, s.log.With("tier", t))
-		b.start()
-		s.tiers[t] = b
-	}
-	s.log.Info("store initialized", "tiers", activeTiers)
-	return nil
+	return conn, nil
 }
 
 // FlushAll synchronously flushes every tier's batch buffer into ClickHouse.
@@ -116,9 +153,10 @@ func (s *Store) FlushAll() error {
 	return firstErr
 }
 
-// CH exposes the underlying ClickHouse connection for subsystems (stats refresh
-// jobs, the API) that run their own queries. Read-only callers only.
-func (s *Store) CH() driver.Conn { return s.ch }
+// CH exposes the stats-pool connection for subsystems (stats refresh jobs,
+// the API) that run their own queries, so heavy snapshot scans never starve
+// the read pool. Read-only callers only.
+func (s *Store) CH() driver.Conn { return s.sch }
 
 // SetOnFlushed registers a callback fired after a batch is durably written to
 // ClickHouse on ANY tier. Used by the crawler to record durable dedup state
@@ -130,8 +168,8 @@ func (s *Store) SetOnFlushed(fn func(events []*nostr.Event)) {
 	}
 }
 
-// Close flushes all batchers, drains the tombstone writer, and closes the
-// connection. Safe to call once.
+// Close flushes all batchers, drains the tombstone writer, and closes every
+// pool connection. Safe to call once.
 func (s *Store) Close() {
 	for _, b := range s.tiers {
 		b.shutdown()
@@ -139,8 +177,10 @@ func (s *Store) Close() {
 	if s.tw != nil {
 		s.tw.stop()
 	}
-	if s.ch != nil {
-		_ = s.ch.Close()
+	for _, c := range []driver.Conn{s.ch, s.sch, s.wch} {
+		if c != nil {
+			_ = c.Close()
+		}
 	}
 }
 
@@ -159,9 +199,12 @@ func (s *Store) SaveEvent(ctx context.Context, evt *nostr.Event) error {
 	return b.enqueue(evt)
 }
 
-// DeleteEvent records a tombstone (instant hide via the dictionary) and reloads
-// the dictionary so the hide is visible to subsequent reads immediately.
-// Physical reclamation, if ever wanted, is a separate periodic ALTER DELETE job.
+// DeleteEvent hands the id to the tombstone writer: a coalesced insert
+// flushes within ~250ms and the dictionary reloads on a bounded (~2s)
+// cadence, so the hide becomes visible to subsequent reads within that
+// window (bounded-latency eventual visibility — no in-process overlay;
+// docs/perf-p4-decisions.md §4.5). Physical reclamation, if ever wanted,
+// is a separate periodic ALTER DELETE job.
 func (s *Store) DeleteEvent(ctx context.Context, evt *nostr.Event) error {
 	return s.retireIDs(ctx, []string{evt.ID}, "nip09", evt.PubKey)
 }
@@ -191,11 +234,12 @@ func (s *Store) ReplaceEvent(ctx context.Context, evt *nostr.Event) error {
 		return s.SaveEvent(ctx, evt)
 	}
 
-	if err := s.acquireRead(ctx); err != nil {
+	release, err := s.acquireRead(ctx)
+	if err != nil {
 		return fmt.Errorf("replace probe: %w", err)
 	}
 	prev, err := s.probeReplaceable(ctx, evt)
-	s.releaseRead()
+	release()
 	if err != nil {
 		return fmt.Errorf("replace query: %w", err)
 	}
@@ -216,10 +260,21 @@ func (s *Store) ReplaceEvent(ctx context.Context, evt *nostr.Event) error {
 	}
 
 	// Save first, then retire. If the save fails we must not hide the old
-	// versions — that would leave the author with nothing served.
+	// versions — that would leave the author with nothing served. Because
+	// SaveEvent only ENQUEUES (the new row isn't queryable until the batcher
+	// flushes, up to maxAge/maxSize later) while the tombstone can hide the
+	// old version within ~250ms–2s, an enqueue-then-retire leaves a window
+	// where a REQ returns NOTHING (grok review #1: retire-before-STORED is
+	// the §1.6 gap). Gate the retire on a synchronous flush of that tier so
+	// the new version is durably queryable first.
 	if shouldStore {
 		if err := s.SaveEvent(ctx, evt); err != nil {
 			return err
+		}
+		if b, ok := s.tiers[tierForEvent(evt, s.cfg.Classifier)]; ok {
+			if err := b.FlushAll(); err != nil {
+				return fmt.Errorf("flush new version before retire: %w", err)
+			}
 		}
 	}
 	if len(retire) > 0 {
@@ -280,10 +335,11 @@ func (s *Store) probeReplaceable(ctx context.Context, evt *nostr.Event) ([]repla
 // (khatru then sends NOTICE) before the result channel is created. The
 // collected rows are then streamed through a buffered channel.
 func (s *Store) QueryEvents(ctx context.Context, f nostr.Filter) (chan *nostr.Event, error) {
-	if err := s.acquireRead(ctx); err != nil {
+	release, err := s.acquireRead(ctx)
+	if err != nil {
 		return nil, err
 	}
-	defer s.releaseRead()
+	defer release()
 
 	collected, err := s.collectEvents(ctx, f)
 	if err != nil {
@@ -354,10 +410,11 @@ func (s *Store) collectEvents(ctx context.Context, f nostr.Filter) ([]*nostr.Eve
 // (no LIMIT 1 BY winner collapse) — a documented divergence (NIP-45 counts
 // are approximate; see perf-plan §1.10).
 func (s *Store) CountEvents(ctx context.Context, f nostr.Filter) (int64, error) {
-	if err := s.acquireRead(ctx); err != nil {
+	release, err := s.acquireRead(ctx)
+	if err != nil {
 		return 0, err
 	}
-	defer s.releaseRead()
+	defer release()
 
 	where, args, _ := buildFilterSQL(f)
 	tiers := tiersForFilter(f, s.cfg.Classifier)
@@ -380,35 +437,45 @@ func (s *Store) CountEvents(ctx context.Context, f nostr.Filter) (int64, error) 
 // joins a bounded waiter queue (cap 16) that is also ctx-cancellable.
 // Overflow of the waiter queue returns ErrReadBusy immediately so khatru
 // can NOTICE rather than accumulating unbounded blocked REQs (codex #11).
-func (s *Store) acquireRead(ctx context.Context) error {
+// khatru internal calls (NIP-09 delete lookups) bypass admission entirely:
+// a delete lookup failing on ErrReadBusy would silently skip tombstoning
+// that id — correctness of hides outranks the bound.
+// acquireRead takes one admission token and returns the matching release
+// func. If all tokens are held, the caller joins a bounded waiter queue
+// (cap 16) that is also ctx-cancellable. Overflow returns ErrReadBusy
+// immediately so khatru can NOTICE rather than accumulating unbounded
+// blocked REQs (codex #11). khatru internal calls (NIP-09 delete lookups)
+// bypass admission entirely — a delete lookup failing on ErrReadBusy would
+// silently skip tombstoning that id; correctness of hides outranks the bound.
+func (s *Store) acquireRead(ctx context.Context) (func(), error) {
+	nop := func() {}
+	if khatru.IsInternalCall(ctx) {
+		return nop, nil
+	}
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return nil, ctx.Err()
 	default:
 	}
 	select {
 	case s.readSem <- struct{}{}:
-		return nil
+		return func() { <-s.readSem }, nil
 	default:
 	}
 	select {
 	case s.readWait <- struct{}{}:
 		defer func() { <-s.readWait }()
 	case <-ctx.Done():
-		return ctx.Err()
+		return nil, ctx.Err()
 	default:
-		return ErrReadBusy
+		return nil, ErrReadBusy
 	}
 	select {
 	case s.readSem <- struct{}{}:
-		return nil
+		return func() { <-s.readSem }, nil
 	case <-ctx.Done():
-		return ctx.Err()
+		return nil, ctx.Err()
 	}
-}
-
-func (s *Store) releaseRead() {
-	<-s.readSem
 }
 
 // tiersForFilter returns the tiers that could contain the filter's kinds.

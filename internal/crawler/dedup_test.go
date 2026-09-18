@@ -212,6 +212,56 @@ func TestDedupWarmReloadsRecentSeen(t *testing.T) {
 	}
 }
 
+func TestStopWriterPersistsQueuedBatches(t *testing.T) {
+	d, db := testDedup(t)
+	const n = 8
+	for i := 0; i < n; i++ {
+		d.OnFlushed([]*nostr.Event{{ID: hexID(i), CreatedAt: nostr.Timestamp(i + 1)}})
+	}
+	d.StartWriter(context.Background())
+	d.StopWriter()
+
+	ids, err := db.LoadRecentSeen(context.Background(), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, id := range ids {
+		got[id] = true
+	}
+	for i := 0; i < n; i++ {
+		if !got[hexID(i)] {
+			t.Errorf("id %s missing from seen_events after StopWriter", hexID(i))
+		}
+	}
+}
+
+func TestWriterCtxCancelDrainsQueue(t *testing.T) {
+	d, db := testDedup(t)
+	const n = 5
+	for i := 0; i < n; i++ {
+		d.OnFlushed([]*nostr.Event{{ID: hexID(i), CreatedAt: nostr.Timestamp(i + 1)}})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	d.StartWriter(ctx)
+	cancel()
+	d.StopWriter()
+
+	ids, err := db.LoadRecentSeen(context.Background(), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, id := range ids {
+		got[id] = true
+	}
+	for i := 0; i < n; i++ {
+		if !got[hexID(i)] {
+			t.Errorf("id %s missing from seen_events after writer ctx cancel", hexID(i))
+		}
+	}
+}
+
 func TestPruneSeenByRowidOffByOne(t *testing.T) {
 	_, db := testDedup(t)
 	ctx := context.Background()
