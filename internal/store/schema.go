@@ -111,6 +111,13 @@ CREATE TABLE IF NOT EXISTS author_follower_counts (
   pubkey    String,
   followers UInt64
 ) ENGINE = MergeTree ORDER BY pubkey;
+
+-- Staging twin for the followers swap: refresh builds into staging, then
+-- EXCHANGE TABLES swaps atomically (P3 F13). Truncated before each build.
+CREATE TABLE IF NOT EXISTS author_follower_counts_staging (
+  pubkey    String,
+  followers UInt64
+) ENGINE = MergeTree ORDER BY pubkey;
 `
 
 // initSchema runs all DDL idempotently.

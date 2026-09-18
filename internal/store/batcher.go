@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -132,14 +133,20 @@ func (b *batcher) run() {
 }
 
 // FlushAll synchronously flushes this tier's buffer (draining the channel
-// first). Safe to call concurrently with enqueue.
-func (b *batcher) FlushAll() {
+// first). Safe to call concurrently with enqueue. Returns the flush error, or
+// ErrBatcherStopped if the worker is gone (P0 F4: errors propagate).
+func (b *batcher) FlushAll() error {
 	reply := make(chan error, 1)
-	b.flushReq <- reply
 	select {
-	case <-reply:
+	case b.flushReq <- reply:
+		select {
+		case err := <-reply:
+			return err
+		case <-time.After(30 * time.Second):
+			return fmt.Errorf("FlushAll timed out (table %s)", b.table)
+		}
 	case <-time.After(30 * time.Second):
-		b.log.Error("FlushAll timed out", "table", b.table)
+		return fmt.Errorf("FlushAll request timed out (table %s)", b.table)
 	}
 }
 

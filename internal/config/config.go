@@ -66,6 +66,10 @@ type Policy struct {
 	MaxAuthors int `yaml:"maxAuthors"` // max authors per filter
 	MaxKinds   int `yaml:"maxKinds"`   // max kinds per filter
 	MaxTags    int `yaml:"maxTags"`    // max total tag values per filter
+	// DefaultSinceHours injects `since` on the pure global-feed REQ shape only
+	// (no ids/authors/tags/since/until) via khatru OverwriteFilter — keeps the
+	// unbounded global scan off ClickHouse (F8). 0 disables.
+	DefaultSinceHours int `yaml:"defaultSinceHours"`
 }
 
 // Crawler configures the per-pubkey priority crawl. Relays here are used ONLY
@@ -113,7 +117,7 @@ func defaults() *Config {
 		// large parts. Dev/tests override these explicitly.
 		Batch:     Batch{MaxSize: 5000, MaxAge: 5 * time.Second},
 		Retention: Retention{Archive: "10 YEAR", Social: "1 YEAR"},
-		Policy:    Policy{MaxIDs: 1000, MaxAuthors: 1000, MaxKinds: 20, MaxTags: 256},
+		Policy:    Policy{MaxIDs: 1000, MaxAuthors: 1000, MaxKinds: 20, MaxTags: 256, DefaultSinceHours: 48},
 		Crawler:   Crawler{Interval: 10 * time.Minute},
 	}
 }

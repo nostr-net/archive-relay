@@ -151,7 +151,14 @@ func main() {
 		func(r *http.Request) bool {
 			return r.Header.Get("Content-Type") == "application/nostr+json+rpc"
 		}, rl)
-	srv := &http.Server{Addr: cfg.Relay.Addr, Handler: handler}
+	srv := &http.Server{
+		Addr:              cfg.Relay.Addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second, // slowloris guard (M8/F19)
+		IdleTimeout:       120 * time.Second,
+		// Read/WriteTimeout deliberately unset: hijacked WS conns are exempt
+		// anyway, and there is no reason to bound them (plan §1.11).
+	}
 	go func() {
 		<-ctx.Done()
 		log.Info("shutting down")

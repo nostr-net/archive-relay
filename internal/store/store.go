@@ -27,6 +27,7 @@ type Store struct {
 	cfg   *config.Config
 	log   *slog.Logger
 	tiers map[string]*batcher // keyed by tier name
+	tw    *tombstoneWriter    // owns all tombstone I/O (§1.3)
 }
 
 // New constructs an unopened Store. Call Init() to connect + create schema.
@@ -62,6 +63,11 @@ func (s *Store) Init() error {
 		return err
 	}
 
+	// tombstone writer: single goroutine owning all tombstone inserts +
+	// bounded dictionary reloads (§1.3).
+	s.tw = newTombstoneWriter(conn, s.log.With("worker", "tombstone"))
+	s.tw.start()
+
 	// start one batcher per active tier
 	s.tiers = make(map[string]*batcher, len(activeTiers))
 	for _, t := range activeTiers {
@@ -74,11 +80,16 @@ func (s *Store) Init() error {
 }
 
 // FlushAll synchronously flushes every tier's batch buffer into ClickHouse.
-// Used by tests (and a future graceful-SIGTERM drain).
-func (s *Store) FlushAll() {
+// Returns the first tier's flush error (or nil). Used by tests and graceful
+// shutdown.
+func (s *Store) FlushAll() error {
+	var firstErr error
 	for _, b := range s.tiers {
-		b.FlushAll()
+		if err := b.FlushAll(); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
+	return firstErr
 }
 
 // CH exposes the underlying ClickHouse connection for subsystems (stats refresh
@@ -95,10 +106,14 @@ func (s *Store) SetOnFlushed(fn func(events []*nostr.Event)) {
 	}
 }
 
-// Close flushes all batchers and closes the connection. Safe to call once.
+// Close flushes all batchers, drains the tombstone writer, and closes the
+// connection. Safe to call once.
 func (s *Store) Close() {
 	for _, b := range s.tiers {
 		b.shutdown()
+	}
+	if s.tw != nil {
+		s.tw.stop()
 	}
 	if s.ch != nil {
 		_ = s.ch.Close()
@@ -127,28 +142,16 @@ func (s *Store) DeleteEvent(ctx context.Context, evt *nostr.Event) error {
 	return s.retireIDs(ctx, []string{evt.ID}, "nip09", evt.PubKey)
 }
 
-// retireIDs tombstones a batch of event ids with a single dictionary reload, so
-// the hides are visible to subsequent reads immediately. Used by DeleteEvent
-// (NIP-09) and ReplaceEvent (superseded versions). reason is a short
-// LowCardinality label ("nip09" / "replaced"); deletedBy is the acting pubkey
-// ("" when unknown, e.g. internal retirement). An insert error aborts the batch;
-// the caller decides whether to surface or log it.
+// retireIDs tombstones a batch of event ids by handing them to the tombstone
+// writer (single coalesced insert + bounded dictionary reload — §1.3). Used by
+// DeleteEvent (NIP-09) and ReplaceEvent (superseded versions). reason is a
+// short LowCardinality label ("nip09" / "replaced"); deletedBy is the acting
+// pubkey ("" when unknown, e.g. internal retirement).
 func (s *Store) retireIDs(ctx context.Context, ids []string, reason, deletedBy string) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	ctx2, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	for _, id := range ids {
-		if err := s.ch.Exec(ctx2,
-			"INSERT INTO tombstones (id, reason, deleted_by) VALUES (?, ?, ?)",
-			id, reason, deletedBy); err != nil {
-			return err
-		}
-	}
-	// make the hides visible now (auto-refresh would also do this within LIFETIME)
-	_ = s.ch.Exec(ctx2, "SYSTEM RELOAD DICTIONARY tombstone_dict")
-	return nil
+	return s.tw.retire(ids, reason, deletedBy)
 }
 
 // ReplaceEvent implements nostr replaceable/addressable semantics: only the
