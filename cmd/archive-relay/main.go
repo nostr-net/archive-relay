@@ -58,7 +58,6 @@ func main() {
 		log.Error("store init failed", "err", err)
 		os.Exit(1)
 	}
-	defer s.Close()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -72,6 +71,16 @@ func main() {
 		log.Warn("dedup warm failed (starting cold)", "err", err)
 	}
 	s.SetOnFlushed(dedup.OnFlushed)
+
+	// Durable seen_events writer + pruner (§1.9). The writer runs on its OWN ctx
+	// so it survives the process ctx cancel long enough to drain the final store
+	// flush (shutdown order: cancel → s.Close → StopWriter → wcancel → cdb.Close).
+	wctx, wcancel := context.WithCancel(context.Background())
+	dedup.StartWriter(wctx)
+	dedup.StartPrune(ctx, crawler.DefaultPruneEvery, crawler.DefaultSeenCap)
+	defer wcancel()
+	defer dedup.StopWriter()
+	defer s.Close()
 
 	// Firehose crawler: subscribe to in-scope kinds from the -sources relays.
 	cr := crawler.New(splitSources(*sources), s, dedup, log.With("pkg", "crawler"))
