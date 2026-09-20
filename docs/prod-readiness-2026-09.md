@@ -82,3 +82,36 @@ strings); writeErr leaking CH internals; classifier override ≠ crawler scope.
 - Reverse proxy terminates TLS; XFF trusted only there
 
 Full ops review transcript: session logs (grok prod-review, 2026-09-19).
+
+---
+
+## Addendum (2026-09-20): re-evaluated for systemd/LXC — READY
+
+Deployment target confirmed as a systemd service on LXC/KVM (no k8s). Two of
+the four blockers were k8s-shaped and are DROPPED as overengineering:
+
+- ~~Liveness/readiness split~~ — systemd `Restart=on-failure` reacts to process
+  exit, not health 503. `/v1/health` is an external-monitor probe, full stop.
+- ~~Bounded shutdown refactor~~ — `TimeoutStopSec=150` in the shipped unit
+  covers worst-case graceful flush (3×30s batchers + 20s tombstones + 10s
+  dedup writer); systemd SIGKILLs after that as designed.
+
+The two deployment-agnostic blockers are FIXED (ce24e0a + 5d86e21):
+
+- First boot: Store.Init now bootstraps via the `default` database and runs
+  `CREATE DATABASE IF NOT EXISTS \`<db>\` ENGINE = Atomic` (identifier-validated).
+  Live-verified: DROP DATABASE → start → auto-created → serving.
+- Ingest stall detection: 15-min idle reconnect (resubscribe; unfinished
+  backfill restarts, never abandoned) + 5-min "firehose heartbeat" journald
+  lines + `ingest{last_event_age_s, dropped_durable_writes, dropped_bad_id}`
+  in `/v1/health`. No metrics server — journald + curl is the monitoring
+  stack for a single host.
+
+Also fixed in the same pass: scheduler fails CLOSED (was ACK-then-drop on
+SQLite errors), health ping on the read pool (was the busy 2-conn stats
+pool), config.example maxSize matches code default, hardened systemd unit
+shipped (`deploy/archive-relay.service`), README systemd runbook + backup
+order, firehose timer leak on reconnect (caught in review r6, fixed r7).
+
+**Verdict for systemd/LXC deployment: READY.** Remaining MEDIUM/LATER items
+in §5 are quality-of-life, not blockers. 7 grok review rounds, all green.
