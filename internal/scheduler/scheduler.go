@@ -37,8 +37,10 @@ func (s *Scheduler) ShouldDefer(evt *nostr.Event) bool {
 	return int64(evt.CreatedAt) > time.Now().Unix()+int64(s.buffer.Seconds())
 }
 
-// Defer parks a future-dated event in SQLite; returns nil so khatru treats it
-// as accepted. PreventBroadcast (wired separately) stops immediate broadcast.
+// Defer parks a future-dated event in SQLite. An error is returned to khatru
+// (OK:false) when the park fails — failing closed beats ACKing an event that
+// PreventBroadcast then suppresses. PreventBroadcast is wired separately to
+// stop immediate broadcast on success.
 func (s *Scheduler) Defer(ctx context.Context, evt *nostr.Event) error {
 	b, err := json.Marshal(evt)
 	if err != nil {

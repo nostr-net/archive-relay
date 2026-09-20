@@ -24,7 +24,8 @@ No orchestrator needed:
 ```bash
 # 1. ClickHouse: install natively (or point clickhouse.addr at any server),
 #    set a password, and put the same credentials in config.yaml.
-# 2. Relay binary + config:
+# 2. Relay binary + config (dedicated service user):
+useradd --system --home /var/lib/archive-relay --shell /usr/sbin/nologin archiver
 install -m 0755 archive-relay /usr/local/bin/
 install -d -o archiver -g archiver /var/lib/archive-relay /etc/archive-relay
 install -m 0600 -o archiver config.yaml /etc/archive-relay/config.yaml

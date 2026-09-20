@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"sort"
 	"time"
 
@@ -117,13 +118,24 @@ func (s *Store) Init() error {
 	return nil
 }
 
+// identifierRe matches a plain ClickHouse identifier (letters, digits,
+// underscore; not starting with a digit) — the only names allowed in the
+// bootstrap CREATE DATABASE DDL.
+var identifierRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
 // ensureDatabase creates the configured database if this is a first boot
-// (the pools below authenticate against it, so it must exist first) and makes
-// sure the engine is Atomic — required by the followers EXCHANGE refresh.
-// Connects to the always-present `default` database for the bootstrap DDL.
+// (the pools below authenticate against it, so it must exist first), using
+// ENGINE=Atomic — required by the followers EXCHANGE refresh. An existing
+// non-Atomic database is NOT converted (IF NOT EXISTS is a no-op); that case
+// still fails loudly later at the stats engine check. Connects to the
+// always-present `default` database for the bootstrap DDL.
 func (s *Store) ensureDatabase() error {
 	if s.cfg.ClickHouse.Database == "" || s.cfg.ClickHouse.Database == "default" {
 		return nil
+	}
+	// the name is embedded in DDL — accept plain identifiers only
+	if !identifierRe.MatchString(s.cfg.ClickHouse.Database) {
+		return fmt.Errorf("clickhouse.database %q is not a valid identifier", s.cfg.ClickHouse.Database)
 	}
 	opts := &clickhouse.Options{
 		Addr: []string{s.cfg.ClickHouse.Addr},
@@ -142,7 +154,7 @@ func (s *Store) ensureDatabase() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := conn.Exec(ctx,
-		fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s ENGINE = Atomic", s.cfg.ClickHouse.Database)); err != nil {
+		fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s` ENGINE = Atomic", s.cfg.ClickHouse.Database)); err != nil {
 		return fmt.Errorf("create database %s: %w", s.cfg.ClickHouse.Database, err)
 	}
 	return nil

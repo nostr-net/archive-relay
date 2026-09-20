@@ -95,6 +95,26 @@ func (c *Crawler) runSource(ctx context.Context, url string, kinds []int) {
 	backfillComplete := false
 	var lastDisconnect time.Time
 
+	// Ingest liveness for a single-host deployment (no kubelet): journald
+	// heartbeat every 5m, and an idle reconnect — go-nostr's WS ping only
+	// detects dead TCP, not a hung-but-pingable subscription. Resubscribing
+	// on idle is cheap (fresh EOSE) and un-sticks both cases. Created ONCE
+	// here: defers inside the reconnect loop would stack a leaked timer per
+	// disconnect (grok r6).
+	hb := time.NewTicker(5 * time.Minute)
+	defer hb.Stop()
+	idle := time.NewTimer(firehoseIdle)
+	defer idle.Stop()
+	resetIdle := func() {
+		if !idle.Stop() {
+			select {
+			case <-idle.C:
+			default:
+			}
+		}
+		idle.Reset(firehoseIdle)
+	}
+
 	for ctx.Err() == nil {
 		filter := nostr.Filter{Kinds: kinds}
 		if since := sinceForReconnect(backfillComplete, lastDisconnect); since != nil {
@@ -120,23 +140,7 @@ func (c *Crawler) runSource(ctx context.Context, url string, kinds []int) {
 		}
 
 		ingested, skipped := 0, 0
-		// Ingest liveness for a single-host deployment (no kubelet): journald
-		// heartbeat every 5m, and an idle reconnect — go-nostr's WS ping only
-		// detects dead TCP, not a hung-but-pingable subscription. Resubscribing
-		// on idle is cheap (fresh EOSE) and un-sticks both cases.
-		hb := time.NewTicker(5 * time.Minute)
-		defer hb.Stop()
-		idle := time.NewTimer(firehoseIdle)
-		defer idle.Stop()
-		resetIdle := func() {
-			if !idle.Stop() {
-				select {
-				case <-idle.C:
-				default:
-				}
-			}
-			idle.Reset(firehoseIdle)
-		}
+		resetIdle()
 		for {
 			select {
 			case <-ctx.Done():
