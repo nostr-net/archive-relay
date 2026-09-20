@@ -3,7 +3,7 @@
 /archive-relay
 *.exe
 *.test
-
+/docs/*
 # local runtime state (NEVER commit)
 control.db
 control.db-*
