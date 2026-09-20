@@ -1,0 +1,42 @@
+# archive-relay systemd unit — copy to /etc/systemd/system/archive-relay.service
+# on an LXC container or KVM VM, then:
+#   systemctl daemon-reload && systemctl enable --now archive-relay
+#
+# TimeoutStopSec covers the worst-case graceful shutdown:
+#   3 sequential batcher flushes (30s each) + tombstone drain (20s)
+#   + seen_events writer (10s) ≈ 120s. Do not lower without code changes.
+# Logs go to journald: journalctl -u archive-relay -f
+# Ingest heartbeat: a "firehose heartbeat" line every 5min per source; a hung
+# subscription self-reconnects after 15min of silence (Warn line).
+
+[Unit]
+Description=Nostr archive relay (ClickHouse-backed)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# Adjust to your install location and user (create a dedicated one).
+User=archiver
+Group=archiver
+ExecStart=/usr/local/bin/archive-relay -config /etc/archive-relay/config.yaml
+WorkingDirectory=/var/lib/archive-relay
+StateDirectory=archive-relay
+Restart=on-failure
+RestartSec=5
+
+# Graceful shutdown budget — see header note.
+TimeoutStopSec=150
+
+# Hardening (LXC-safe; KVM-safe).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/archive-relay
+# Resource guidance: RSS ~40-300MB (dedup maps + batcher buffers); raised
+# when memory accounting is available in the container/VM.
+# MemoryMax=1G
+
+[Install]
+WantedBy=multi-user.target

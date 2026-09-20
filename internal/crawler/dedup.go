@@ -59,6 +59,7 @@ type Dedup struct {
 	writeQ        chan []control.SeenRef
 	droppedWrites atomic.Uint64
 	droppedBadID  atomic.Uint64
+	lastEvent     atomic.Int64 // unix nano of the last marked id — ingest heartbeat
 
 	writerMu      sync.Mutex
 	writerRunning bool
@@ -183,6 +184,7 @@ func (d *Dedup) MarkMany(ids ...string) {
 }
 
 func (d *Dedup) insertLocked(key [32]byte) {
+	d.lastEvent.Store(time.Now().UnixNano())
 	d.cur[key] = struct{}{}
 	if len(d.cur) >= memCap {
 		d.prev = d.cur
@@ -208,6 +210,17 @@ func (d *Dedup) DroppedWrites() uint64 { return d.droppedWrites.Load() }
 
 // DroppedBadID is the number of unseen events dropped for an id↔body mismatch.
 func (d *Dedup) DroppedBadID() uint64 { return d.droppedBadID.Load() }
+
+// LastEventAgo returns how long ago the last NEW event was ingested (0 =
+// never). The ingest heartbeat: distinguishes a quiet relay from a hung
+// subscription when paired with the crawler's reconnect log lines.
+func (d *Dedup) LastEventAgo() time.Duration {
+	ts := d.lastEvent.Load()
+	if ts == 0 {
+		return 0
+	}
+	return time.Since(time.Unix(0, ts))
+}
 
 // OnFlushed records durable dedup state for a batch after it is safely in
 // ClickHouse. In-memory MarkMany is synchronous (cheap). The SQLite write is

@@ -15,6 +15,41 @@ cp config.example.yaml config.yaml
 ./archive-relay --config config.yaml                # :3334, crawls 4 relays
 ```
 
+The first boot creates its ClickHouse database (ENGINE=Atomic) automatically.
+
+## Production (systemd on an LXC container / KVM VM)
+
+No orchestrator needed:
+
+```bash
+# 1. ClickHouse: install natively (or point clickhouse.addr at any server),
+#    set a password, and put the same credentials in config.yaml.
+# 2. Relay binary + config:
+install -m 0755 archive-relay /usr/local/bin/
+install -d -o archiver -g archiver /var/lib/archive-relay /etc/archive-relay
+install -m 0600 -o archiver config.yaml /etc/archive-relay/config.yaml
+# 3. Service (hardened unit with the shutdown-budget comment):
+install -m 0644 deploy/archive-relay.service /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now archive-relay
+journalctl -u archive-relay -f
+```
+
+`TimeoutStopSec=150` in the unit covers the worst-case graceful flush
+(3×30s batchers + 20s tombstones + 10s dedup writer). Monitoring is
+journald + curl — no metrics server needed:
+
+```bash
+curl -s localhost:3334/v1/health
+# → ingest.last_event_age_s (alert if climbing past ~30m on a busy relay),
+#   ingest.dropped_durable_writes / dropped_bad_id (want 0 or flat),
+#   "firehose heartbeat" log lines every 5min per source.
+```
+
+Backups: snapshot ClickHouse first, then copy `control.db` + `control.db-wal`
++ `control.db-shm` AFTER a quiet period (or stop the service first). A stale
+`seen_events` is safe (re-ingest dedupes); a stale `allowed_pubkeys`/
+`scheduled_events` is not — back up SQLite regularly.
+
 Plain HTTP/WS by design — front it with a TLS proxy (Caddy/nginx/Traefik) for
 `wss://`, and give ClickHouse a password before exposing it.
 

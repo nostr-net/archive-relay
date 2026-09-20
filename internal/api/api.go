@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
@@ -22,6 +23,7 @@ import (
 
 type eventStore interface {
 	CH() driver.Conn
+	Ping(ctx context.Context) error
 	QueryEvents(context.Context, nostr.Filter) (chan *nostr.Event, error)
 }
 
@@ -33,7 +35,14 @@ type Handler struct {
 	limiter *policy.Limiter // optional per-IP REST rate limit
 	access  *policy.Access  // optional: when enabled, /v1/* requires NIP-98 + allow-list
 	log     *slog.Logger
+
+	// healthExtra, if set, contributes extra fields to /v1/health (ingest
+	// heartbeat counters). Wired by main; keeps api decoupled from crawler.
+	healthExtra atomic.Pointer[func() map[string]any]
 }
+
+// SetHealthExtra registers extra /v1/health fields (e.g. ingest counters).
+func (h *Handler) SetHealthExtra(fn func() map[string]any) { h.healthExtra.Store(&fn) }
 
 // NewHandler constructs the API handler. limiter and access may be nil.
 func NewHandler(s *stats.Service, st *store.Store, limiter *policy.Limiter,
@@ -66,21 +75,29 @@ func (h *Handler) Register(mux *http.ServeMux) {
 func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
-	chOK := h.store.CH().Ping(ctx) == nil
+	// Ping on the READ pool (16 conns), not the 2-conn stats pool that 120s
+	// FINAL refresh jobs occupy — a busy refresh must not flap the probe.
+	chOK := h.store.Ping(ctx) == nil
 	var events uint64
 	if chOK {
 		_ = h.store.CH().QueryRow(ctx, `SELECT sum(rows) FROM system.parts
 WHERE active AND database = currentDatabase()
   AND table IN ('events_permanent','events_archive','events_social')`).Scan(&events)
 	}
+	out := map[string]any{
+		"ok": chOK, "clickhouse": chOK, "events": events,
+		"events_note": "physical rows (size gauge, includes duplicates/tombstoned)",
+	}
+	if fn := h.healthExtra.Load(); fn != nil {
+		for k, v := range (*fn)() {
+			out[k] = v
+		}
+	}
 	code := http.StatusOK
 	if !chOK {
 		code = http.StatusServiceUnavailable
 	}
-	writeJSON(w, code, map[string]any{
-		"ok": chOK, "clickhouse": chOK, "events": events,
-		"events_note": "physical rows (size gauge, includes duplicates/tombstoned)",
-	})
+	writeJSON(w, code, out)
 }
 
 func (h *Handler) daily(w http.ResponseWriter, r *http.Request) {

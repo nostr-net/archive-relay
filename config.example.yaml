@@ -13,7 +13,7 @@ sqlite:
   path: "./control.db"    # embedded control plane (crawler/scheduler/auth state)
 
 batch:
-  maxSize: 10000          # flush a tier after this many buffered events
+  maxSize: 5000          # flush a tier after this many buffered events
   maxAge: 5s              # ...or after this duration, whichever is first
 
 policy:                  # REQ/COUNT breadth caps; 0 on a field = no limit

@@ -20,6 +20,12 @@ import (
 // unfinished history is not abandoned (plan §1.8 / §3).
 const reconnectOverlap = 2 * time.Hour
 
+// firehoseIdle is how long a live subscription may deliver nothing before we
+// tear it down and resubscribe. Long enough that a legitimately quiet relay
+// isn't churned; short enough that a hung subscription can't silently stop
+// ingest for hours (go-nostr's 29s pings only catch dead TCP).
+const firehoseIdle = 15 * time.Minute
+
 // Crawler fans out one ingestion goroutine per source relay URL.
 type Crawler struct {
 	sources []string
@@ -114,12 +120,37 @@ func (c *Crawler) runSource(ctx context.Context, url string, kinds []int) {
 		}
 
 		ingested, skipped := 0, 0
+		// Ingest liveness for a single-host deployment (no kubelet): journald
+		// heartbeat every 5m, and an idle reconnect — go-nostr's WS ping only
+		// detects dead TCP, not a hung-but-pingable subscription. Resubscribing
+		// on idle is cheap (fresh EOSE) and un-sticks both cases.
+		hb := time.NewTicker(5 * time.Minute)
+		defer hb.Stop()
+		idle := time.NewTimer(firehoseIdle)
+		defer idle.Stop()
+		resetIdle := func() {
+			if !idle.Stop() {
+				select {
+				case <-idle.C:
+				default:
+				}
+			}
+			idle.Reset(firehoseIdle)
+		}
 		for {
 			select {
 			case <-ctx.Done():
 				lastDisconnect = time.Now()
 				_ = relay.Close()
 				return
+			case <-hb.C:
+				log.Info("firehose heartbeat", "ingested", ingested, "skipped", skipped,
+					"last_event_ago", c.dedup.LastEventAgo().Round(time.Second).String())
+			case <-idle.C:
+				log.Warn("no events for idle window; reconnecting", "idle_window", firehoseIdle)
+				lastDisconnect = time.Now()
+				_ = relay.Close()
+				goto next
 			case <-sub.EndOfStoredEvents:
 				backfillComplete = true
 				log.Info("EOSE; continuing for live events", "ingested", ingested, "skipped", skipped)
@@ -136,6 +167,7 @@ func (c *Crawler) runSource(ctx context.Context, url string, kinds []int) {
 					_ = relay.Close()
 					goto next
 				}
+				resetIdle()
 				if c.handle(ctx, ev) {
 					ingested++
 				} else {

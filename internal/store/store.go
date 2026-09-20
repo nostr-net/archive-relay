@@ -75,6 +75,9 @@ func New(cfg *config.Config, log *slog.Logger) *Store {
 // Init connects to ClickHouse (three pools: write/read/stats — §1.5), creates
 // the schema, and starts the batchers.
 func (s *Store) Init() error {
+	if err := s.ensureDatabase(); err != nil {
+		return err
+	}
 	wch, err := s.openConn(poolWriteConns)
 	if err != nil {
 		return err
@@ -111,6 +114,37 @@ func (s *Store) Init() error {
 	}
 	s.log.Info("store initialized", "tiers", activeTiers,
 		"pools", fmt.Sprintf("write=%d read=%d stats=%d", poolWriteConns, poolReadConns, poolStatsConns))
+	return nil
+}
+
+// ensureDatabase creates the configured database if this is a first boot
+// (the pools below authenticate against it, so it must exist first) and makes
+// sure the engine is Atomic — required by the followers EXCHANGE refresh.
+// Connects to the always-present `default` database for the bootstrap DDL.
+func (s *Store) ensureDatabase() error {
+	if s.cfg.ClickHouse.Database == "" || s.cfg.ClickHouse.Database == "default" {
+		return nil
+	}
+	opts := &clickhouse.Options{
+		Addr: []string{s.cfg.ClickHouse.Addr},
+		Auth: clickhouse.Auth{
+			Database: "default",
+			Username: s.cfg.ClickHouse.Username,
+			Password: s.cfg.ClickHouse.Password,
+		},
+		DialTimeout: 5 * time.Second,
+	}
+	conn, err := clickhouse.Open(opts)
+	if err != nil {
+		return fmt.Errorf("clickhouse open (bootstrap): %w", err)
+	}
+	defer conn.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := conn.Exec(ctx,
+		fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s ENGINE = Atomic", s.cfg.ClickHouse.Database)); err != nil {
+		return fmt.Errorf("create database %s: %w", s.cfg.ClickHouse.Database, err)
+	}
 	return nil
 }
 
@@ -157,6 +191,16 @@ func (s *Store) FlushAll() error {
 // the API) that run their own queries, so heavy snapshot scans never starve
 // the read pool. Read-only callers only.
 func (s *Store) CH() driver.Conn { return s.sch }
+
+// Ping checks ClickHouse liveness on the read pool — the right pool for
+// probes (16 conns; the 2-conn stats pool can be busy for 120s with a FINAL
+// refresh job and flap a health check).
+func (s *Store) Ping(ctx context.Context) error {
+	if s.ch == nil {
+		return errors.New("store not initialized")
+	}
+	return s.ch.Ping(ctx)
+}
 
 // SetOnFlushed registers a callback fired after a batch is durably written to
 // ClickHouse on ANY tier. Used by the crawler to record durable dedup state

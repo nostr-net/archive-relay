@@ -123,6 +123,8 @@ type healthStore struct {
 
 func (s healthStore) CH() driver.Conn { return s.conn }
 
+func (s healthStore) Ping(ctx context.Context) error { return s.conn.Ping(ctx) }
+
 type healthConn struct {
 	driver.Conn
 	pingErr  error

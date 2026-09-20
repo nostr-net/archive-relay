@@ -46,8 +46,12 @@ func (s *Scheduler) Defer(ctx context.Context, evt *nostr.Event) error {
 	}
 	if err := s.db.SaveScheduled(ctx, evt.ID, string(b), int64(evt.CreatedAt)); err != nil {
 		s.log.Warn("defer failed", "id", evt.ID, "err", err)
+		// Fail CLOSED: returning the error makes khatru answer OK:false. The
+		// old fail-open path ACKed the event AND PreventBroadcast suppressed
+		// it — a disk-full SQLite silently lost future-dated events.
+		return err
 	}
-	return nil // accept regardless; a failed park still shouldn't error to the client
+	return nil
 }
 
 // Run polls for due events and publishes them. Blocks until ctx is canceled.

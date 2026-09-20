@@ -138,7 +138,17 @@ func main() {
 	})
 	go sched.Run(ctx)
 
-	api.NewHandler(svc, s, limiter, access, breadth, log.With("pkg", "api")).Register(rl.Router())
+	h := api.NewHandler(svc, s, limiter, access, breadth, log.With("pkg", "api"))
+	h.SetHealthExtra(func() map[string]any {
+		return map[string]any{
+			"ingest": map[string]any{
+				"last_event_age_s":       dedup.LastEventAgo().Round(time.Second).Seconds(),
+				"dropped_durable_writes": dedup.DroppedWrites(),
+				"dropped_bad_id":         dedup.DroppedBadID(),
+			},
+		}
+	})
+	h.Register(rl.Router())
 
 	// Ops profiling (stdlib pprof) on loopback only — never on the public port.
 	// net/http/pprof registers its handlers on http.DefaultServeMux at import.
