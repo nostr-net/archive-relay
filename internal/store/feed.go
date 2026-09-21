@@ -118,6 +118,15 @@ func (w *feedWriter) run() {
 		if len(buf) == 0 {
 			return
 		}
+		w.dropsM.Lock()
+		dropped := w.drops
+		w.drops = 0
+		w.dropsM.Unlock()
+		if dropped > 0 {
+			// ponnytail: aggregate-per-flush logging; per-event would spam at
+			// overload. Wire Drops() into /v1/health if feed holes ever matter.
+			w.log.Warn("feed writer dropped events (feed will have holes until they age out of the window)", "n", dropped)
+		}
 		if err := w.insert(ctx, buf); err != nil {
 			// Feed is best-effort: log and move on (next flush re-offers via
 			// nothing — these rows are lost from the feed until TTL window

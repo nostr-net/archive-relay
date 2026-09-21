@@ -101,6 +101,15 @@ func (s *Store) Init() error {
 	s.fw = newFeedWriter(wch, s.log.With("worker", "feed"))
 	s.fw.start()
 
+	// Upgrade path: an existing install has 48h of window in the tier tables
+	// but an empty events_feed — exclusive feed routing would serve nothing
+	// until organic ingest refills it. Backfill the TTL window once when the
+	// feed is empty (idempotent enough: read-side id-dedupe collapses the
+	// re-copied rows a crashed backfill can leave behind).
+	if err := s.backfillFeed(ctx); err != nil {
+		s.log.Warn("feed backfill failed; feed path falls back to tiers until refill", "err", err)
+	}
+
 	// start one batcher per active tier
 	s.tiers = make(map[string]*batcher, len(activeTiers))
 	for _, t := range activeTiers {
@@ -457,8 +466,16 @@ func (s *Store) collectEvents(ctx context.Context, f nostr.Filter) ([]*nostr.Eve
 	// The pure global-feed shape (bounded recent window) is served from
 	// events_feed — reverse-ordered early termination instead of a full
 	// window scan (docs/read-perf-2026-09.md: ~18× on the same data).
+	// Bounded staleness: feed lags the tier tables by ≤ feedFlushEvery (~5s)
+	// plus any feed-writer drops — a just-published event can be missing from
+	// a pure-feed REQ for that window (author/tag/ID REQs hit tiers and see
+	// it immediately). On any feed query error we fall back to the tier scan.
 	if s.fw != nil && feedEligible(f, s.cfg.Classifier) {
-		return s.collectFeed(ctx, f, limit)
+		collected, err := s.collectFeed(ctx, f, limit)
+		if err == nil {
+			return collected, nil
+		}
+		s.log.Warn("feed query failed; falling back to tier scan", "err", err)
 	}
 
 	where, args, tail := buildFilterSQL(f)
@@ -564,6 +581,27 @@ func (s *Store) acquireRead(ctx context.Context) (func(), error) {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+}
+
+// backfillFeed populates events_feed from the tier tables when it is empty
+// (first boot after upgrade, or after an outage longer than the feed TTL).
+// Bounded by the feed retention window.
+func (s *Store) backfillFeed(ctx context.Context) error {
+	var n uint64
+	if err := s.wch.QueryRow(ctx, "SELECT count() FROM events_feed").Scan(&n); err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	start := time.Now()
+	err := s.wch.Exec(ctx, fmt.Sprintf(
+		"INSERT INTO events_feed (%s) SELECT %s FROM events_all WHERE created_at >= toUnixTimestamp(now()) - %d",
+		tierColumns, tierColumns, int(feedRetention.Seconds())))
+	if err == nil {
+		s.log.Info("feed backfilled from tiers", "took", time.Since(start).Round(time.Millisecond))
+	}
+	return err
 }
 
 // replaceableKinds mirrors the collapse key's replaceable set.
