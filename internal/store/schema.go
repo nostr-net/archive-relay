@@ -170,6 +170,9 @@ func (s *Store) initSchema(ctx context.Context) error {
 	if err := s.execParts(ctx, snapshotsDDL); err != nil {
 		return err
 	}
+	if err := s.execParts(ctx, feedDDL()); err != nil {
+		return err
+	}
 	for _, tier := range activeTiers {
 		table := "events_" + tier
 		// Was idx_pubkey just created, or has a materialize mutation never been

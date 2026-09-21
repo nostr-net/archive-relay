@@ -40,6 +40,11 @@ type batcher struct {
 	// atomic.Pointer so SetOnFlushed is race-free even after workers start.
 	onFlushed atomic.Pointer[func([]*nostr.Event)]
 
+	// feed, if set, receives every durably-flushed event for the recent-feed
+	// mirror (events_feed). Offered after Send() succeeds — feed lags tiers
+	// by at most feedFlushEvery.
+	feed *feedWriter
+
 	in       chan *nostr.Event
 	flushReq chan chan error // FlushAll sends a reply chan; worker drains+flushes, then replies
 
@@ -147,6 +152,11 @@ func (b *batcher) run() {
 		}
 		if fn := b.onFlushed.Load(); fn != nil {
 			(*fn)(chunk)
+		}
+		if b.feed != nil {
+			for _, evt := range chunk {
+				b.feed.offer(evt)
+			}
 		}
 		pending = pending[n:]
 		if len(pending) == 0 {

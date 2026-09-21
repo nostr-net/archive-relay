@@ -43,6 +43,7 @@ type Store struct {
 	log   *slog.Logger
 	tiers map[string]*batcher // keyed by tier name
 	tw    *tombstoneWriter    // owns all tombstone I/O (§1.3)
+	fw    *feedWriter         // recent-feed mirror for the global-feed shape
 
 	// readSem is the shared query admission semaphore (cap 16 = read pool
 	// bound). QueryEvents, CountEvents, and ReplaceEvent's slim probe all
@@ -96,10 +97,15 @@ func (s *Store) Init() error {
 	s.tw = newTombstoneWriter(wch, s.log.With("worker", "tombstone"))
 	s.tw.start()
 
+	// recent-feed mirror writer (global-feed read path — docs/read-perf-2026-09.md)
+	s.fw = newFeedWriter(wch, s.log.With("worker", "feed"))
+	s.fw.start()
+
 	// start one batcher per active tier
 	s.tiers = make(map[string]*batcher, len(activeTiers))
 	for _, t := range activeTiers {
 		b := newBatcher(wch, t, s.cfg.Batch.MaxSize, s.cfg.Batch.MaxAge, s.log.With("tier", t))
+		b.feed = s.fw
 		b.start()
 		s.tiers[t] = b
 	}
@@ -232,6 +238,9 @@ func (s *Store) Close() {
 	}
 	if s.tw != nil {
 		s.tw.stop()
+	}
+	if s.fw != nil {
+		s.fw.stop()
 	}
 	for _, c := range []driver.Conn{s.ch, s.sch, s.wch} {
 		if c != nil {
@@ -440,13 +449,20 @@ func (s *Store) QueryEvents(ctx context.Context, f nostr.Filter) (chan *nostr.Ev
 }
 
 func (s *Store) collectEvents(ctx context.Context, f nostr.Filter) ([]*nostr.Event, error) {
-	where, args, tail := buildFilterSQL(f)
-	tiers := tiersForFilter(f, s.cfg.Classifier)
-
 	limit := f.Limit
 	if limit < 1 || limit > defaultQueryLimit {
 		limit = defaultQueryLimit
 	}
+
+	// The pure global-feed shape (bounded recent window) is served from
+	// events_feed — reverse-ordered early termination instead of a full
+	// window scan (docs/read-perf-2026-09.md: ~18× on the same data).
+	if s.fw != nil && feedEligible(f, s.cfg.Classifier) {
+		return s.collectFeed(ctx, f, limit)
+	}
+
+	where, args, tail := buildFilterSQL(f)
+	tiers := tiersForFilter(f, s.cfg.Classifier)
 
 	var collected []*nostr.Event
 	for _, t := range tiers {
@@ -548,6 +564,107 @@ func (s *Store) acquireRead(ctx context.Context) (func(), error) {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+}
+
+// replaceableKinds mirrors the collapse key's replaceable set.
+var replaceableKinds = map[int]bool{0: true, 3: true, 10002: true}
+
+// collectFeed serves the pure global-feed shape from events_feed as two
+// queries: (A) non-replaceable kinds — reverse read of (created_at,id) with
+// plain LIMIT, early-terminates after ~limit rows; (B) replaceable kinds —
+// LIMIT 1 BY winner collapse over the (small) replaceable subset. Results
+// are id-deduped (re-ingest dupes), globally sorted (created_at DESC,
+// id ASC) and trimmed to the request limit in Go — the same merge contract
+// as the tier path.
+func (s *Store) collectFeed(ctx context.Context, f nostr.Filter, limit int) ([]*nostr.Event, error) {
+	where, args, _ := buildFilterSQL(f) // tail differs per step
+	fetch := limit + 50                 // margin: boundary ties + dup-id dedup
+
+	kindsA, kindsB := splitFeedKinds(f.Kinds, s.cfg.Classifier)
+	var collected []*nostr.Event
+	for _, step := range []struct {
+		kinds []int
+		order string // must match reverse read for step A; winner order for B
+		by    string
+	}{{
+		kinds: kindsA,
+		// id DESC matches the reverse of the table's (created_at,id) order —
+		// no re-sort, LIMIT terminates the read.
+		order: "ORDER BY created_at DESC, id DESC",
+	}, {
+		kinds: kindsB,
+		order: "ORDER BY created_at DESC, id ASC " + collapseLimitBy,
+	}} {
+		if len(step.kinds) == 0 {
+			continue
+		}
+		q := fmt.Sprintf("SELECT %s FROM events_feed WHERE kind IN (?) AND %s %s LIMIT %d",
+			readColumns, where, step.order, fetch)
+		stepArgs := append([]any{int32s(step.kinds)}, args...)
+		rows, err := s.ch.Query(ctx, q, stepArgs...)
+		if err != nil {
+			return nil, fmt.Errorf("query events_feed: %w", err)
+		}
+		for rows.Next() {
+			e, err := scanEvent(rows)
+			if err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("scan events_feed: %w", err)
+			}
+			collected = append(collected, e)
+		}
+		qErr := rows.Err()
+		_ = rows.Close()
+		if qErr != nil {
+			return nil, fmt.Errorf("rows events_feed: %w", qErr)
+		}
+	}
+
+	// id-dedupe (re-ingest duplicates across feed parts), then deterministic
+	// global order + limit.
+	seen := make(map[string]struct{}, len(collected))
+	uniq := collected[:0]
+	for _, e := range collected {
+		if _, ok := seen[e.ID]; ok {
+			continue
+		}
+		seen[e.ID] = struct{}{}
+		uniq = append(uniq, e)
+	}
+	sortDesc(uniq)
+	if len(uniq) > limit {
+		uniq = uniq[:limit]
+	}
+	s.log.Debug("feed scan", "rows", len(uniq))
+	return uniq, nil
+}
+
+// splitFeedKinds divides the filter's kinds into non-replaceable (plain
+// reverse read) and replaceable (winner collapse). Empty filter kinds → all
+// in-scope kinds. Dropped kinds are excluded (they are never written).
+func splitFeedKinds(filterKinds []int, override map[int]string) (a, b []int) {
+	if len(filterKinds) == 0 {
+		filterKinds = InScopeKinds()
+	}
+	for _, k := range filterKinds {
+		if classifyWithOverride(k, override) == TierDrop {
+			continue
+		}
+		if replaceableKinds[k] {
+			b = append(b, k)
+		} else {
+			a = append(a, k)
+		}
+	}
+	return a, b
+}
+
+func int32s(ks []int) []int32 {
+	out := make([]int32, len(ks))
+	for i, k := range ks {
+		out[i] = int32(k)
+	}
+	return out
 }
 
 // tiersForFilter returns the tiers that could contain the filter's kinds.
